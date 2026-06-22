@@ -365,7 +365,7 @@ async def list_work_orders(
     filter: Optional[str] = None,  # "all" | "priority" | "pending"
     _=Depends(get_current_user),
 ):
-    cursor = db.work_orders.find({}, {"_id": 0})
+    cursor = db.work_orders.find({}, {"_id": 0}).limit(200)
     items: List[WorkOrderSummary] = []
     async for wo in cursor:
         done, overall = stage_progress(wo["stages"])
@@ -522,7 +522,7 @@ async def audit_log(work_order_id: str, _=Depends(get_current_user)):
 @api.get("/inspections/history", response_model=List[HistoryItem])
 async def history(current=Depends(get_current_user)):
     out: List[HistoryItem] = []
-    cursor = db.work_orders.find({}, {"_id": 0})
+    cursor = db.work_orders.find({}, {"_id": 0}).limit(200)
     async for wo in cursor:
         for s in wo["stages"]:
             if s.get("submitted_at"):
@@ -567,7 +567,7 @@ async def dashboard(current=Depends(get_current_user)):
     quota = await db.quota.find_one({"date": today}, {"_id": 0}) or {"completed": 0, "target": 25}
     # current assignment = first priority not-done WO
     current_wo = None
-    cursor = db.work_orders.find({}, {"_id": 0}).sort("priority", -1)
+    cursor = db.work_orders.find({}, {"_id": 0}).sort("priority", -1).limit(50)
     async for wo in cursor:
         done, overall = stage_progress(wo["stages"])
         if overall != "done":
