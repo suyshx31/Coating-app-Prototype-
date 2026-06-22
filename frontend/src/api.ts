@@ -66,6 +66,27 @@ export const api = {
   history: () => request<HistoryItem[]>(`/inspections/history`),
   weather: () => request<Weather>(`/weather`),
   dashboard: () => request<Dashboard>(`/dashboard`),
+  coatingSpecs: () => request<CoatingSpec[]>(`/coating-specifications`),
+  createWorkOrder: (body: CreateWorkOrderBody) =>
+    request<WorkOrderSummary>(`/work-orders`, { method: "POST", body: JSON.stringify(body) }),
+};
+
+export type CoatingSpec = {
+  code: string;
+  name: string;
+  spec: PaintSpec;
+};
+
+export type CreateWorkOrderBody = {
+  customer_name: string;
+  customer_address?: string;
+  po_number: string;
+  po_line_item_number: number;
+  part_number: string;
+  part_revision_number: string;
+  coating_spec_code: string;
+  coating_spec_revision_number: string;
+  quantity: number;
 };
 
 export type WorkOrderSummary = {

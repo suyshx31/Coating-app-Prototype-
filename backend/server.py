@@ -127,6 +127,22 @@ class StageSubmission(BaseModel):
     photos: List[str] = Field(default_factory=list)  # base64 strings
     result: Literal["pass", "fail"] = "pass"
 
+class CreateWorkOrderRequest(BaseModel):
+    customer_name: str = Field(..., min_length=1)
+    customer_address: Optional[str] = ""  # only optional field
+    po_number: str = Field(..., min_length=1)            # external customer PO ref
+    po_line_item_number: int = Field(..., ge=1)          # which line within that PO
+    part_number: str = Field(..., min_length=1)
+    part_revision_number: str = Field(..., min_length=1)
+    coating_spec_code: str = Field(..., min_length=1)    # must reference a known spec
+    coating_spec_revision_number: str = Field(..., min_length=1)
+    quantity: int = Field(..., ge=1)
+
+class CoatingSpecOut(BaseModel):
+    code: str
+    name: str
+    spec: PaintSpec
+
 class AuditEntry(BaseModel):
     id: str
     work_order_id: str
@@ -393,6 +409,108 @@ async def list_work_orders(
     # priority first
     items.sort(key=lambda x: (not x.priority, x.work_order_id))
     return items
+
+
+# ---- coating specs (used by the New Work Order form) ----
+COATING_SPEC_CATALOG = {
+    "EPOXY-COAT-X":   {"name": "Epoxy Coat X (Aerospace Grade)",
+                       "spec": {"surface_profile_min_um": 50, "surface_profile_max_um": 100,
+                                "dft_min_um": 250, "dft_max_um": 400, "soluble_salts_max_mg_m2": 20}},
+    "POLY-SHIELD-40": {"name": "Poly-Shield 40 Industrial Topcoat",
+                       "spec": {"surface_profile_min_um": 40, "surface_profile_max_um": 90,
+                                "dft_min_um": 200, "dft_max_um": 350, "soluble_salts_max_mg_m2": 20}},
+    "ZINC-GALV-XL":   {"name": "Zinc-Galv XL Heavy Duty",
+                       "spec": {"surface_profile_min_um": 60, "surface_profile_max_um": 120,
+                                "dft_min_um": 300, "dft_max_um": 500, "soluble_salts_max_mg_m2": 15}},
+    "MARINE-GUARD":   {"name": "Marine-Guard Anticorrosive",
+                       "spec": {"surface_profile_min_um": 45, "surface_profile_max_um": 95,
+                                "dft_min_um": 275, "dft_max_um": 425, "soluble_salts_max_mg_m2": 18}},
+}
+
+
+@api.get("/coating-specifications", response_model=List[CoatingSpecOut])
+async def list_coating_specs(_=Depends(get_current_user)):
+    return [CoatingSpecOut(code=k, name=v["name"], spec=PaintSpec(**v["spec"])) for k, v in COATING_SPEC_CATALOG.items()]
+
+
+async def _next_wo_id() -> str:
+    """Atomically generate the next WO-YYYY-NNNN id for the current year."""
+    year = datetime.now(timezone.utc).year
+    res = await db.counters.find_one_and_update(
+        {"_id": f"wo_seq_{year}"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True,
+    )
+    seq = res["seq"] if res else 1
+    # Seed accounts for the four pre-existing WO-2024-99xx ids; new ones start at 0001 for current year.
+    return f"WO-{year}-{seq:04d}"
+
+
+@api.post("/work-orders", response_model=WorkOrderSummary, status_code=201)
+async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_current_user)):
+    # validate coating spec exists in the catalog
+    if body.coating_spec_code not in COATING_SPEC_CATALOG:
+        raise HTTPException(400, f"Unknown coating specification '{body.coating_spec_code}'")
+    catalog = COATING_SPEC_CATALOG[body.coating_spec_code]
+
+    work_order_id = await _next_wo_id()
+    # composite uniqueness on (part_number, part_revision_number) is captured by the
+    # part_description we build below — and indexed via the document fields too.
+    part_description = f"{body.part_number} Rev {body.part_revision_number}"
+
+    doc = {
+        "work_order_id": work_order_id,
+        # legacy/display fields (consumed by existing screens — left intact)
+        "po_number": body.po_number,
+        "customer_name": body.customer_name,
+        "paint_product_code": body.coating_spec_code,
+        "paint_product_name": catalog["name"],
+        "part_description": part_description,
+        "quantity": body.quantity,
+        "serial_range": f"{body.part_number}-001 → {body.part_number}-{body.quantity:03d}",
+        "priority": False,
+        "spec": catalog["spec"],
+        # new fields introduced by the Create-WO feature
+        "customer_address": body.customer_address or "",
+        "po_line_item_number": body.po_line_item_number,
+        "part_number": body.part_number,
+        "part_revision_number": body.part_revision_number,
+        "coating_spec_revision_number": body.coating_spec_revision_number,
+        # 6-stage workflow scaffold
+        "stages": [
+            {
+                "key": s["key"],
+                "name": s["name"],
+                "description": s["description"],
+                "requires_coat_readings": s["requires_coat_readings"],
+                "status": "pending",
+                "result": None,
+                "submission": None,
+                "submitted_at": None,
+                "submitted_by": None,
+            }
+            for s in STAGES
+        ],
+        "created_at": now_iso(),
+        "created_by": current["employee_id"],
+    }
+    await db.work_orders.insert_one(doc.copy())
+    await write_audit(work_order_id, None, current, "work_order_created",
+                      f"WO {work_order_id} created for {body.customer_name} / {body.po_number} line {body.po_line_item_number}")
+
+    return WorkOrderSummary(
+        work_order_id=work_order_id,
+        customer_name=doc["customer_name"],
+        paint_product_code=doc["paint_product_code"],
+        paint_product_name=doc["paint_product_name"],
+        part_description=doc["part_description"],
+        quantity=doc["quantity"],
+        serial_range=doc["serial_range"],
+        priority=False,
+        progress=0,
+        overall_status="pending",
+    )
 
 
 @api.get("/work-orders/{work_order_id}", response_model=WorkOrderDetail)

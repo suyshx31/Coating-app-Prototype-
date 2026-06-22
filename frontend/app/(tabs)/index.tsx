@@ -52,9 +52,14 @@ export default function OrdersTab() {
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>QC INSPECTOR</Text>
-        <TouchableOpacity testID="orders-profile-shortcut" onPress={() => router.push("/(tabs)/profile")}>
-          <Ionicons name="person-circle-outline" size={28} color={colors.textPrimary} />
-        </TouchableOpacity>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+          <TouchableOpacity testID="new-work-order-header-btn" onPress={() => router.push("/work-order/new")}>
+            <Ionicons name="add-circle" size={28} color={colors.accent} />
+          </TouchableOpacity>
+          <TouchableOpacity testID="orders-profile-shortcut" onPress={() => router.push("/(tabs)/profile")}>
+            <Ionicons name="person-circle-outline" size={28} color={colors.textPrimary} />
+          </TouchableOpacity>
+        </View>
       </View>
 
       <View style={styles.searchRow}>
@@ -160,6 +165,15 @@ export default function OrdersTab() {
               </Card>
 
               <Label style={{ marginTop: spacing.sm }}>Work Orders ({items.length})</Label>
+              <TouchableOpacity
+                testID="new-work-order-cta"
+                onPress={() => router.push("/work-order/new")}
+                style={styles.newWoCta}
+                activeOpacity={0.85}
+              >
+                <Ionicons name="add" size={18} color={colors.textInverse} />
+                <Text style={styles.newWoCtaText}>NEW WORK ORDER</Text>
+              </TouchableOpacity>
             </View>
           ) : null
         }
@@ -268,4 +282,15 @@ const styles = StyleSheet.create({
   progressTrack: { height: 6, backgroundColor: colors.bg, borderRadius: 999, marginTop: 8, overflow: "hidden", borderWidth: 1, borderColor: colors.border },
   progressFill: { height: "100%", backgroundColor: colors.brand },
   dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.successText },
+  newWoCta: {
+    marginTop: spacing.sm,
+    backgroundColor: colors.accent,
+    paddingVertical: 14,
+    borderRadius: radius.button,
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 6,
+  },
+  newWoCtaText: { color: colors.textInverse, fontWeight: "800", letterSpacing: 1, fontSize: 13 },
 });

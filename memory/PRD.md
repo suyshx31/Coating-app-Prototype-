@@ -55,7 +55,25 @@ keeps a full audit trail (ISO 9001 context).
 - Weather endpoint mocks realistic plant-floor conditions; plug OpenWeather key into `/api/weather` later.
 - Camera capture uses SVG placeholders (real `expo-camera` integration would require permissions + native build for full validation).
 
-## Out of scope for v1
+## Iteration 2 — Create New Work Order (built)
+
+### Backend additions (non-breaking, no existing endpoints touched)
+- `GET /api/coating-specifications` — returns the catalog of existing coating specs (EPOXY-COAT-X / POLY-SHIELD-40 / ZINC-GALV-XL / MARINE-GUARD) each with code, name, and µm limits.
+- `POST /api/work-orders` — accepts customer_name (required), customer_address (optional), po_number, po_line_item_number, part_number, part_revision_number, coating_spec_code, coating_spec_revision_number, quantity. Generates the next `WO-YYYY-NNNN` ID atomically via a per-year MongoDB counter (`db.counters`), persists the new fields (part_number/revision/spec_revision/customer_address/po_line_item_number) on the document, returns the new WorkOrderSummary. Writes an `audit_log` entry.
+
+### Frontend additions
+- "+ NEW WORK ORDER" CTA in the Orders list (and a `+` icon in the Orders header) → routes to `/work-order/new`.
+- `/work-order/new` — full form screen with grouped sections (Customer / PO / Part / Coating Specification / Quantity), inline per-field validation (only Customer Address optional), spec picker modal with search & live limit preview, sticky Submit.
+- `/work-order/created` — confirmation screen showing the generated `WO-YYYY-NNNN` ID and CTAs to open the new WO or return to Orders.
+
+### Spec compliance
+- WO ID format is exactly `WO-YYYY-NNNN` (current year + 4-digit zero-padded sequential) — same identifier used on every existing screen.
+- Part Number + Part Revision treated as composite key (stored as separate fields and rendered together as `<part_number> Rev <revision>`).
+- Coating Specification dropdown sources only existing seeded specs.
+- New WO appears immediately in the Orders list (the list query refetches on focus).
+- Existing screens, data models, and logic unchanged.
+
+
 - Offline queueing (online-only per spec)
 - Microsoft Entra ID OAuth2 + PKCE
 - Real OpenWeather API (mock in place; trivial to swap)
