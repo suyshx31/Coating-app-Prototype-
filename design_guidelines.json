@@ -1,0 +1,261 @@
+{
+  "app_name": "Coating Portal",
+  "theme": "Light",
+  "archetype": "4 (Swiss & High-Contrast) - Industrial Field Mod",
+  "design_philosophy": {
+    "core_principles": [
+      "Authority & Clarity: Information must be objective, readable at a glance in harsh environments.",
+      "Action-Oriented: Minimal cognitive load; highlight only what needs input or validation.",
+      "Industrial Aesthetics: Sharp corners, bold monospace IDs, high contrast, clean white cards on light gray backgrounds.",
+      "Safety First: Emphasize Pass/Fail states explicitly with stark red/green contrast."
+    ]
+  },
+  "colors": {
+    "background": {
+      "app": "#F3F4F6",
+      "card": "#FFFFFF",
+      "bottom_tab": "#FFFFFF"
+    },
+    "text": {
+      "primary": "#0B132B",
+      "secondary": "#4B5563",
+      "muted": "#9CA3AF",
+      "inverse": "#FFFFFF"
+    },
+    "brand": {
+      "primary": "#0A0A0A",
+      "accent": "#D97706"
+    },
+    "status": {
+      "success_bg": "#ECFDF5",
+      "success_text": "#059669",
+      "error_bg": "#FEF2F2",
+      "error_text": "#DC2626",
+      "warning_bg": "#FFFBEB",
+      "warning_text": "#D97706",
+      "pending_bg": "#F3F4F6",
+      "pending_text": "#6B7280"
+    },
+    "borders": {
+      "default": "#E5E7EB",
+      "focus": "#D97706",
+      "error": "#EF4444"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "body": "Chivo, system-ui, sans-serif",
+      "monospace": "Roboto Mono, monospace"
+    },
+    "scale": {
+      "h1": { "fontSize": 32, "lineHeight": 40, "fontFamily": "Chivo", "fontWeight": "800", "letterSpacing": -0.5 },
+      "h2": { "fontSize": 24, "lineHeight": 32, "fontFamily": "Chivo", "fontWeight": "700" },
+      "h3": { "fontSize": 20, "lineHeight": 28, "fontFamily": "Chivo", "fontWeight": "600" },
+      "body_large": { "fontSize": 18, "lineHeight": 28, "fontFamily": "Chivo", "fontWeight": "400" },
+      "body_base": { "fontSize": 16, "lineHeight": 24, "fontFamily": "Chivo", "fontWeight": "400" },
+      "label": { "fontSize": 14, "lineHeight": 20, "fontFamily": "Roboto Mono", "fontWeight": "600", "textTransform": "uppercase" },
+      "data_id": { "fontSize": 16, "lineHeight": 24, "fontFamily": "Roboto Mono", "fontWeight": "700", "color": "#D97706" },
+      "caption": { "fontSize": 12, "lineHeight": 16, "fontFamily": "Roboto Mono", "fontWeight": "500", "letterSpacing": 0.5 }
+    }
+  },
+  "spacing_and_layout": {
+    "padding": {
+      "xs": 4,
+      "sm": 8,
+      "md": 16,
+      "lg": 24,
+      "xl": 32,
+      "2xl": 48
+    },
+    "corners": {
+      "sharp": 2,
+      "button": 4,
+      "pill": 999
+    },
+    "layout_rules": [
+      "Use SafeAreaView for all top-level screen components.",
+      "Maintain a 16px horizontal margin for all main content containers.",
+      "Card items must have at least 16px internal padding.",
+      "Input fields must have 48px minimum height for tap accessibility.",
+      "Form layouts must be single-column to prevent horizontal scrolling and ensure field clarity."
+    ]
+  },
+  "components": {
+    "buttons": {
+      "primary": {
+        "backgroundColor": "#0A0A0A",
+        "color": "#FFFFFF",
+        "borderRadius": 4,
+        "paddingVertical": 16,
+        "alignItems": "center",
+        "justifyContent": "center",
+        "fontWeight": "bold",
+        "textTransform": "uppercase"
+      },
+      "secondary": {
+        "backgroundColor": "transparent",
+        "borderColor": "#0A0A0A",
+        "borderWidth": 1,
+        "color": "#0A0A0A",
+        "borderRadius": 4,
+        "paddingVertical": 16
+      },
+      "disabled": {
+        "backgroundColor": "#D1D5DB",
+        "color": "#9CA3AF"
+      }
+    },
+    "cards": {
+      "base": {
+        "backgroundColor": "#FFFFFF",
+        "borderRadius": 2,
+        "borderWidth": 1,
+        "borderColor": "#E5E7EB",
+        "padding": 16,
+        "marginBottom": 16,
+        "shadowColor": "transparent",
+        "elevation": 0
+      }
+    },
+    "status_pills": {
+      "base": {
+        "paddingHorizontal": 12,
+        "paddingVertical": 4,
+        "borderRadius": 2,
+        "fontFamily": "Roboto Mono",
+        "fontSize": 12,
+        "fontWeight": "700",
+        "textTransform": "uppercase"
+      }
+    },
+    "inputs": {
+      "text": {
+        "borderWidth": 1,
+        "borderColor": "#D1D5DB",
+        "borderRadius": 2,
+        "padding": 16,
+        "fontSize": 16,
+        "fontFamily": "Chivo",
+        "backgroundColor": "#F9FAFB",
+        "minHeight": 56
+      },
+      "label": {
+        "fontFamily": "Roboto Mono",
+        "fontSize": 12,
+        "color": "#4B5563",
+        "marginBottom": 8,
+        "textTransform": "uppercase"
+      }
+    }
+  },
+  "screens_and_workflows": {
+    "login": {
+      "features": ["Email/Password inputs", "Seeded accounts", "Primary CTA: LOGIN"]
+    },
+    "orders_tab": {
+      "features": [
+        "Search bar at the top",
+        "Filter Chips row (All | Priority | Pending)",
+        "Daily Quota Card (Progress bar: e.g., 14/25)",
+        "Active Shift Card",
+        "System Status Card (SYNCED)",
+        "Work Order List Cards"
+      ],
+      "card_details": "Displays WO-YYYY-NNNN (e.g. WO-2024-0012) in Roboto Mono / Accent Orange, Customer Name, Paint Product Chip, 'INSPECT' CTA."
+    },
+    "work_order_detail": {
+      "features": [
+        "Header with WO-YYYY-NNNN",
+        "6-Stage Pipeline List (Surface Prep -> Primer Coat -> Mid-Inspection -> Top Coat -> Curing -> Final QC)",
+        "Stage Status Badges (DONE, PENDING, IN-PROGRESS, FAIL)",
+        "View Audit Log CTA",
+        "Bottom Sticky CTA: 'UPDATE SELECTED STAGE'"
+      ]
+    },
+    "inspection_stage_form": {
+      "features": [
+        "Environmental Conditions Block (Auto weather fetch + Manual surface temp). Must show start/end reading pair for both.",
+        "Gate Check Alert: Surface Temp > Dew Point + 3°C (Shows PASS or FAIL badge). If fail, prevent submission.",
+        "Measured Parameters Block: Surface Profile in µm (with spec range hint).",
+        "Measured Parameters Block: DFT in µm with Min & Max limits. HARD-BLOCK (disable submit/show error) on Max exceedance.",
+        "Measured Parameters Block: Soluble Salts (mg/m²).",
+        "Start/End Reading Toggle (Tab or segmented control) to log twice per stage.",
+        "Photo Capture dashed dropzone (Max 5 photos) with thumbnail strip.",
+        "Inspection Notes textarea.",
+        "Sticky Bottom Primary CTA: SUBMIT INSPECTION"
+      ]
+    },
+    "audit_log": {
+      "features": ["Chronological list of actions", "Timestamps in Mono font", "Actor ID (QC-7742)", "Action details"]
+    },
+    "profile_tab": {
+      "features": [
+        "Avatar Headshot",
+        "Name: THOMPSON, J. - LEAD INSPECTOR",
+        "Employee ID: #QC-7742 (Mono font)",
+        "Details: Shift, Department, Email",
+        "Sync Settings row",
+        "App Version text",
+        "Secondary CTA: SIGN OUT"
+      ]
+    }
+  },
+  "data_model_enforcements": {
+    "work_order_id_format": "Strictly 'WO-YYYY-NNNN' (e.g., WO-2024-0892) globally.",
+    "surface_profile_unit": "Strictly 'µm' (microns). DO NOT USE 'MM'.",
+    "environmental_pairs": "Weather and Surface Temp MUST have separate UI blocks. Each block must have inputs for Start and End readings.",
+    "dft_hard_block": "Dry Film Thickness requires both MIN and MAX thresholds. If input > MAX, trigger inline error state and disable submit button."
+  },
+  "media_assets": {
+    "avatars": [
+      {
+        "url": "https://images.pexels.com/photos/10816007/pexels-photo-10816007.jpeg",
+        "description": "Male inspector professional avatar",
+        "category": "profile_avatar"
+      },
+      {
+        "url": "https://images.pexels.com/photos/29852895/pexels-photo-29852895.jpeg",
+        "description": "Female inspector professional avatar",
+        "category": "profile_avatar_alternative"
+      }
+    ],
+    "backgrounds": [
+      {
+        "url": "https://images.pexels.com/photos/14804687/pexels-photo-14804687.jpeg",
+        "description": "Manufacturing plant worker background, useful for login screen top half or empty states",
+        "category": "login_background"
+      },
+      {
+        "url": "https://images.pexels.com/photos/34718932/pexels-photo-34718932.jpeg",
+        "description": "Industrial metal tools, useful as thumbnail for live feed",
+        "category": "live_feed_thumbnail"
+      }
+    ]
+  },
+  "testing_attributes": {
+    "convention": "data-testid",
+    "format": "kebab-case, role-based",
+    "examples": [
+      "data-testid='login-submit-button'",
+      "data-testid='work-order-card-WO-2024-0012'",
+      "data-testid='stage-status-badge-primer'",
+      "data-testid='env-surface-temp-start-input'",
+      "data-testid='dft-measurement-input'",
+      "data-testid='gate-check-pass-badge'"
+    ]
+  },
+  "instructions_to_main_agent": [
+    "You are building a React Native mobile app using Expo. Use StyleSheet for styles instead of Tailwind CSS.",
+    "Follow the specified color palette strictly. Backgrounds should be light gray (#F3F4F6) with white cards and dark navy text. The primary brand CTA should be black (#0A0A0A). IDs should be colored #D97706.",
+    "Borders must be sharp (borderRadius: 2 or 0) across all cards to maintain the brutalist/industrial theme.",
+    "Typography: Use Roboto Mono (or similar available monospace font) for all labels, IDs, and numeric data to ensure tabular alignment and technical aesthetic.",
+    "Input Layouts: Labels above inputs, large minimum heights (48px) for touch targets.",
+    "Gate Check Validation: Implement logic for `Surface Temp > Dew Point + 3°C`. Render a visible 'PASS' or 'FAIL' pill in the UI.",
+    "DFT Validation: Ensure Dry Film Thickness accepts input, compares against a defined min/max, and hard-disables the Submit button if max is exceeded.",
+    "Use the exact Work Order ID format WO-YYYY-NNNN globally.",
+    "Display Surface Profile in µm, not MM.",
+    "Render start/end pairs for Weather and Surface Temperature as explicit form controls (or via a tab/segmented control toggling between Start and End readings).",
+    "Include 'data-testid' on all interactive elements (buttons, inputs, tabs, list items).",
+    "Use standard React Native components (View, Text, TextInput, TouchableOpacity, ScrollView, SafeAreaView, etc)."
+  ]
+}
