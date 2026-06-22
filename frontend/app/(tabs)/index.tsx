@@ -107,7 +107,12 @@ export default function OrdersTab() {
               <Card style={{ borderLeftWidth: 4, borderLeftColor: colors.accent }}>
                 <View style={styles.rowBetween}>
                   <Label>Current Assignment</Label>
-                  {dash.current_assignment?.priority ? <StatusPill status="fail" testID="priority-pill" /> : null}
+                  {dash.current_assignment?.priority ? (
+                    <View style={styles.prioBadge} testID="priority-pill">
+                      <Ionicons name="flame" size={11} color={colors.errorText} />
+                      <Text style={styles.prioText}>PRIORITY</Text>
+                    </View>
+                  ) : null}
                 </View>
                 {dash.current_assignment ? (
                   <>
