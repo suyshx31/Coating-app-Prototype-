@@ -16,7 +16,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
-import { api, CoatingSpec, CreateWorkOrderBody } from "@/src/api";
+import { api, CoatingSpec, CreateWorkOrderBody, DuplicateExistingWO } from "@/src/api";
 import { colors, radius, spacing, type } from "@/src/theme";
 import { Card, Label } from "@/src/components/UI";
 
@@ -53,6 +53,7 @@ export default function NewWorkOrderScreen() {
   const [showSpecPicker, setShowSpecPicker] = useState(false);
   const [specSearch, setSpecSearch] = useState("");
   const [serverError, setServerError] = useState<string | null>(null);
+  const [duplicateWo, setDuplicateWo] = useState<DuplicateExistingWO | null>(null);
   const [touched, setTouched] = useState<Record<keyof Form, boolean>>({} as any);
 
   useEffect(() => {
@@ -88,30 +89,40 @@ export default function NewWorkOrderScreen() {
 
   const canSubmit = Object.keys(errors).length === 0 && !submitting;
 
-  const onSubmit = async () => {
+  const buildBody = (): CreateWorkOrderBody => ({
+    customer_name: form.customer_name.trim(),
+    customer_address: form.customer_address.trim() || undefined,
+    po_number: form.po_number.trim(),
+    po_line_item_number: Number(form.po_line_item_number),
+    part_number: form.part_number.trim(),
+    part_revision_number: form.part_revision_number.trim(),
+    coating_spec_code: form.coating_spec_code,
+    coating_spec_revision_number: form.coating_spec_revision_number.trim(),
+    quantity: Number(form.quantity),
+  });
+
+  const doCreate = async (confirmDuplicate: boolean) => {
     setServerError(null);
-    setTouched(Object.fromEntries(Object.keys(form).map((k) => [k, true])) as any);
-    if (!canSubmit) return;
     setSubmitting(true);
     try {
-      const body: CreateWorkOrderBody = {
-        customer_name: form.customer_name.trim(),
-        customer_address: form.customer_address.trim() || undefined,
-        po_number: form.po_number.trim(),
-        po_line_item_number: Number(form.po_line_item_number),
-        part_number: form.part_number.trim(),
-        part_revision_number: form.part_revision_number.trim(),
-        coating_spec_code: form.coating_spec_code,
-        coating_spec_revision_number: form.coating_spec_revision_number.trim(),
-        quantity: Number(form.quantity),
-      };
-      const created = await api.createWorkOrder(body);
+      const created = await api.createWorkOrder({ ...buildBody(), confirm_duplicate: confirmDuplicate });
+      setDuplicateWo(null);
       router.replace(`/work-order/created?id=${encodeURIComponent(created.work_order_id)}`);
     } catch (e: any) {
-      setServerError(e?.message || "Failed to create work order");
+      if (e?.status === 409 && e?.body?.detail?.duplicate) {
+        setDuplicateWo(e.body.detail.existing as DuplicateExistingWO);
+      } else {
+        setServerError(e?.message || "Failed to create work order");
+      }
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const onSubmit = async () => {
+    setTouched(Object.fromEntries(Object.keys(form).map((k) => [k, true])) as any);
+    if (!canSubmit) return;
+    await doCreate(false);
   };
 
   const pickedSpec = specs.find((s) => s.code === form.coating_spec_code);
@@ -296,6 +307,99 @@ export default function NewWorkOrderScreen() {
       </KeyboardAvoidingView>
 
       <Modal
+        visible={!!duplicateWo}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setDuplicateWo(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.dupCard} testID="duplicate-warning-modal">
+            <View style={styles.dupIconWrap}>
+              <Ionicons name="warning" size={32} color={colors.warningText} />
+            </View>
+            <Text style={[type.h3, { textAlign: "center", marginTop: spacing.md }]}>
+              Possible Duplicate Work Order
+            </Text>
+            <Text style={[type.bodySm, { textAlign: "center", marginTop: 6 }]}>
+              A work order already exists for{"\n"}
+              PO <Text style={type.mono}>{form.po_number}</Text> · line{" "}
+              <Text style={type.mono}>{form.po_line_item_number}</Text> · part{" "}
+              <Text style={type.mono}>{form.part_number} Rev {form.part_revision_number}</Text>.
+            </Text>
+
+            {duplicateWo ? (
+              <View style={styles.dupExisting} testID="duplicate-existing-info">
+                <View style={styles.dupRow}>
+                  <Text style={type.caption}>EXISTING WO</Text>
+                  <Text style={[type.dataId, { fontSize: 15 }]} testID="duplicate-existing-id">
+                    #{duplicateWo.work_order_id}
+                  </Text>
+                </View>
+                <View style={styles.dupRow}>
+                  <Text style={type.caption}>STATUS</Text>
+                  <Text style={[type.mono, { textTransform: "uppercase" }]}>
+                    {duplicateWo.overall_status} · {duplicateWo.progress}/6
+                  </Text>
+                </View>
+                <View style={styles.dupRow}>
+                  <Text style={type.caption}>CREATED BY</Text>
+                  <Text style={type.mono}>#{duplicateWo.created_by}</Text>
+                </View>
+                <View style={styles.dupRow}>
+                  <Text style={type.caption}>CREATED AT</Text>
+                  <Text style={type.mono}>{new Date(duplicateWo.created_at).toLocaleString()}</Text>
+                </View>
+                <View style={styles.dupRow}>
+                  <Text style={type.caption}>QTY</Text>
+                  <Text style={type.mono}>{duplicateWo.quantity} pcs</Text>
+                </View>
+              </View>
+            ) : null}
+
+            <TouchableOpacity
+              testID="duplicate-open-existing"
+              onPress={() => {
+                const id = duplicateWo?.work_order_id;
+                setDuplicateWo(null);
+                if (id) router.replace(`/work-order/${id}`);
+              }}
+              style={styles.dupPrimaryCta}
+              activeOpacity={0.85}
+            >
+              <Ionicons name="open-outline" size={16} color={colors.textInverse} />
+              <Text style={styles.dupPrimaryCtaText}>OPEN EXISTING WO</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              testID="duplicate-create-anyway"
+              onPress={() => doCreate(true)}
+              disabled={submitting}
+              style={[styles.dupDangerCta, submitting && { opacity: 0.5 }]}
+              activeOpacity={0.85}
+            >
+              {submitting ? (
+                <ActivityIndicator color={colors.errorText} />
+              ) : (
+                <>
+                  <Ionicons name="add-circle-outline" size={16} color={colors.errorText} />
+                  <Text style={styles.dupDangerCtaText}>CREATE ANYWAY</Text>
+                </>
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              testID="duplicate-cancel"
+              onPress={() => setDuplicateWo(null)}
+              style={styles.dupCancel}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.dupCancelText}>CANCEL</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
         visible={showSpecPicker}
         animationType="slide"
         transparent
@@ -430,4 +534,14 @@ const styles = StyleSheet.create({
   modalHandle: { alignSelf: "center", width: 40, height: 4, borderRadius: 2, backgroundColor: colors.border, marginBottom: spacing.md },
   specOption: { flexDirection: "row", alignItems: "center", gap: 8, padding: spacing.md, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, marginBottom: spacing.sm },
   modalClose: { alignSelf: "center", paddingVertical: 12, paddingHorizontal: 24, marginTop: spacing.sm },
+  dupCard: { width: "92%", maxWidth: 420, backgroundColor: colors.card, borderRadius: radius.sharp, borderWidth: 1, borderColor: colors.warningText, padding: spacing.lg, alignItems: "stretch" },
+  dupIconWrap: { alignSelf: "center", width: 56, height: 56, borderRadius: radius.sharp, backgroundColor: colors.warningBg, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.warningText },
+  dupExisting: { marginTop: spacing.md, padding: spacing.md, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bg, borderRadius: radius.sharp, gap: 8 },
+  dupRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  dupPrimaryCta: { marginTop: spacing.lg, backgroundColor: colors.brand, paddingVertical: 14, borderRadius: radius.button, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8 },
+  dupPrimaryCtaText: { color: colors.textInverse, fontWeight: "800", letterSpacing: 1, fontSize: 13 },
+  dupDangerCta: { marginTop: spacing.sm, borderWidth: 1, borderColor: colors.borderError, paddingVertical: 14, borderRadius: radius.button, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: colors.errorBg },
+  dupDangerCtaText: { color: colors.errorText, fontWeight: "800", letterSpacing: 1, fontSize: 12 },
+  dupCancel: { marginTop: spacing.sm, paddingVertical: 12, alignItems: "center" },
+  dupCancelText: { color: colors.textSecondary, fontWeight: "700", letterSpacing: 1, fontSize: 12 },
 });

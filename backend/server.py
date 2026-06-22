@@ -137,6 +137,7 @@ class CreateWorkOrderRequest(BaseModel):
     coating_spec_code: str = Field(..., min_length=1)    # must reference a known spec
     coating_spec_revision_number: str = Field(..., min_length=1)
     quantity: int = Field(..., ge=1)
+    confirm_duplicate: bool = False  # set to True to override the duplicate guard
 
 class CoatingSpecOut(BaseModel):
     code: str
@@ -453,6 +454,43 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
     if body.coating_spec_code not in COATING_SPEC_CATALOG:
         raise HTTPException(400, f"Unknown coating specification '{body.coating_spec_code}'")
     catalog = COATING_SPEC_CATALOG[body.coating_spec_code]
+
+    # duplicate guard: same PO + line item + part + revision = likely the same job
+    if not body.confirm_duplicate:
+        dup = await db.work_orders.find_one(
+            {
+                "po_number": body.po_number,
+                "po_line_item_number": body.po_line_item_number,
+                "part_number": body.part_number,
+                "part_revision_number": body.part_revision_number,
+            },
+            {"_id": 0, "work_order_id": 1, "customer_name": 1, "paint_product_code": 1,
+             "quantity": 1, "created_at": 1, "created_by": 1, "stages": 1},
+        )
+        if dup:
+            done, overall = stage_progress(dup.get("stages", []))
+            await write_audit(
+                dup["work_order_id"], None, current, "work_order_duplicate_warned",
+                f"Inspector {current['employee_id']} attempted to create a duplicate WO for "
+                f"PO {body.po_number} line {body.po_line_item_number} part {body.part_number} rev {body.part_revision_number}",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "duplicate": True,
+                    "message": "A work order already exists for this PO line + part + revision.",
+                    "existing": {
+                        "work_order_id": dup["work_order_id"],
+                        "customer_name": dup.get("customer_name"),
+                        "paint_product_code": dup.get("paint_product_code"),
+                        "quantity": dup.get("quantity"),
+                        "created_at": dup.get("created_at"),
+                        "created_by": dup.get("created_by"),
+                        "overall_status": overall,
+                        "progress": done,
+                    },
+                },
+            )
 
     work_order_id = await _next_wo_id()
     # composite uniqueness on (part_number, part_revision_number) is captured by the

@@ -87,6 +87,18 @@ export type CreateWorkOrderBody = {
   coating_spec_code: string;
   coating_spec_revision_number: string;
   quantity: number;
+  confirm_duplicate?: boolean;
+};
+
+export type DuplicateExistingWO = {
+  work_order_id: string;
+  customer_name: string;
+  paint_product_code: string;
+  quantity: number;
+  created_at: string;
+  created_by: string;
+  overall_status: string;
+  progress: number;
 };
 
 export type WorkOrderSummary = {
