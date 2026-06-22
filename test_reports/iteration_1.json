@@ -1,0 +1,52 @@
+{
+  "summary": "Coating Portal v1 first-build end-to-end validation. Backend pytest suite (19 tests across auth, work orders, weather, dashboard, stage submission, audit log, history) all pass against the live preview URL after a minor test-side fix (used the right WO whose paint product has dft_max_um=400 for the hard-block case). Frontend mobile flow exercised on the Expo web preview at 390x844: login (default-filled creds + SIGN IN), Orders tab (current assignment + 17/25 quota + SYNCED + Alpha-Section 4 shift + 4 work-order cards in WO-2024-NNNN format with PRIORITY badge), filter chips (All/Priority/Pending narrow list correctly), search input ('Aerospace' narrows to 1 card), WO detail (spec block 50-100µm / 250-400µm / ≤20 mg/m² for EPOXY-COAT-X; 2 stages pre-marked DONE for WO-2024-9901), Update Selected Stage form (START/END phase toggle, FETCH weather button auto-fills air/RH/dew, surface-temp gate-check pill flips PASS/FAIL, phase values preserved across toggle), DFT hard-block (typing 400 on POLY-SHIELD-40 surfaces 'HARD BLOCK · DFT 400 µm exceeds max 350 µm' inline + bottom indicator FAIL), Submit happy path navigates to /work-order/WO-2024-9905/submitted with PASS pill + summary, RETURN TO ORDER LIST returns to tabs, daily quota incremented 17→18, audit-log includes the new entry. Profile tab renders 'Thompson, J.' and SIGN OUT clears storage and bounces to login. One UI bug found: Current Assignment card pill renders text 'FAIL' instead of 'PRIORITY' (StatusPill is fed status='fail' to get red styling, but the component prints the status word). Deprecation warning surfaced from one screen ('props.pointerEvents is deprecated. Use style.pointerEvents') — non-blocking. No deprecated Expo packages (expo-av/expo-barcode-scanner/expo-background-fetch) detected.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "All endpoints", "issue": "passlib bcrypt version detection warning at startup ('AttributeError: module bcrypt has no attribute __about__'); harmless but noisy. Pin bcrypt<4.1 or upgrade passlib."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "(tabs)/index.tsx · Current Assignment card",
+        "issue": "Priority indicator on the dashboard renders the literal text 'FAIL' in a red pill instead of 'PRIORITY'. Root cause: <StatusPill status=\"fail\" testID=\"priority-pill\" /> reuses StatusPill purely for its red color, but StatusPill writes the status keyword. Replace with a dedicated PRIORITY badge (same styling as the work-order card's prioBadge, lines 254-255) or pass a label override.",
+        "testID": "priority-pill",
+        "priority": "HIGH"
+      },
+      {
+        "component": "stage/[stage].tsx Submit button (line 401)",
+        "issue": "On hard block the TouchableOpacity is functionally disabled via canSubmit=false (correct), but the DOM has no `disabled` attribute on web, so accessibility tooling and Playwright's is_disabled() report it as enabled. Consider adding accessibilityState={{disabled: !canSubmit}} or rendering as a real <button disabled> on web. Minor a11y/testability concern only.",
+        "testID": "submit-inspection-btn",
+        "priority": "LOW"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Stage form", "issues": ["Inline 'HARD BLOCK' message is clearly visible but the bottom Submit bar still shows 'Ready to submit' alongside a red FAIL pill — wording is ambiguous; consider 'Submission blocked by hard limit'."]}
+    ],
+    "react_native_issues": [
+      {"component": "Unknown screen (warning printed once on app load)", "issue": "Console warning: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Search for components passing pointerEvents as a prop (likely a third-party or a wrapper View) and migrate to style.pointerEvents."}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_coating_portal.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Fix Current Assignment 'FAIL' pill → render a dedicated PRIORITY badge in app/(tabs)/index.tsx (the same prioBadge used on each work-order card already exists).",
+    "Optional: add accessibilityState={{disabled: !canSubmit}} on the stage-form submit TouchableOpacity to expose the disabled state to assistive tech and tests.",
+    "Optional: migrate `pointerEvents` prop to style.pointerEvents on whichever view triggers the deprecation warning at app load.",
+    "Optional: pin bcrypt<4.1 (or upgrade passlib) to silence the 'module bcrypt has no attribute __about__' warning."
+  ],
+  "critical_code_review_comments": [
+    "server.py login uses req.email.lower() which is correct, but pydantic EmailStr does not normalize casing — seeded emails are already lowercase so this is fine; just be aware if future seeds use mixed-case emails.",
+    "POST /stages/{stage_key}/submit always writes the submission even on result=fail with HTTP 200 + ok=true. Frontend submitted.tsx must handle result=fail too — quickly verified the route accepts ?result=fail and displays a FAIL pill via the same screen, so OK.",
+    "stage_progress() returns overall_status='fail' when any stage failed, which means a single failed early stage will make /api/work-orders show overall_status=fail and filter=pending will still include it (since != 'done'). Acceptable per spec, just noting.",
+    "MeasuredParameters has no min on surface_profile_um value — a negative or zero value will be accepted by Pydantic (numeric). Server validation against spec then marks result=fail. Could add Field(ge=0)."
+  ],
+  "updated_files": ["/app/backend/tests/test_coating_portal.py (new)"],
+  "success_rate": {"backend": "100% (19/19)", "frontend": "95% — one UI bug (Current Assignment pill text), one deprecation warning, all functional flows pass"},
+  "seed_data_creation": "No external seed created; relied on server.py's seed_data() (4 work orders, 2 inspectors, today's quota). UI submissions added entries to WO-2024-9905 stages (surface_prep, primer_coat, mid_inspection done).",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend already running and seeded. Test file at /app/backend/tests/test_coating_portal.py can be re-run with: EXPO_PUBLIC_BACKEND_URL=https://coating-portal.preview.emergentagent.com pytest /app/backend/tests/test_coating_portal.py -v. UI bug to verify after fix: open Orders tab, the Current Assignment card top-right pill should read 'PRIORITY' (red), not 'FAIL'.",
+  "rca_of_issue": "Current-Assignment pill bug RCA: app/(tabs)/index.tsx line 110 uses `<StatusPill status=\"fail\" testID=\"priority-pill\" />` purely to get a red badge. The StatusPill component (UI.tsx) maps status → label text by uppercasing the status keyword, so the user sees 'FAIL'. Fix: render the dedicated prioBadge used in renderItem (lines 170-175 of the same file) or extend StatusPill with an optional `label` prop. Reproduce by signing in as j.thompson and observing the Current Assignment card on Orders tab."
+}
