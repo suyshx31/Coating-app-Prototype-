@@ -19,7 +19,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, cast
 
 import jwt
 from dotenv import load_dotenv
@@ -29,6 +29,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
+from supabase import create_client, Client as SupabaseClient
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -45,6 +46,15 @@ bearer = HTTPBearer(auto_error=False)
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
+
+# ---------- supabase ----------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+supabase: Optional[SupabaseClient] = (
+    create_client(SUPABASE_URL, SUPABASE_KEY)
+    if SUPABASE_URL and SUPABASE_KEY
+    else None
+)
 
 # ---------- stages ----------
 STAGES = [
@@ -143,6 +153,43 @@ class CoatingSpecOut(BaseModel):
     code: str
     name: str
     spec: PaintSpec
+
+class PaintSystemSpec(BaseModel):
+    """Row from Supabase `paint_system_specifications` (imported from MVG040014N.xlsx)."""
+    specification: str
+    spec_rev: Optional[str] = None
+    surface_preparation: Optional[str] = None
+    curing_test_method: Optional[str] = None
+    adhesion_tape_inspection_method: Optional[str] = None
+    wft_measurement_method: Optional[str] = None
+    oil_water_test_method: Optional[str] = None
+    surface_profile_test_method: Optional[str] = None
+    dft_test_method: Optional[str] = None
+    mek_resistance_test_method: Optional[str] = None
+    section: Optional[str] = None
+    system_number: Optional[float] = None
+    application_service_category: Optional[str] = None
+    anchor_profile_mils: Optional[str] = None
+    paint_brand: Optional[str] = None
+    top_coat_ral_shade: Optional[float] = None
+    primer_paint_product: Optional[str] = None
+    primer_coat_dft_low_mils: Optional[float] = None
+    primer_coat_dft_high_mils: Optional[float] = None
+    primer_coat_color: Optional[str] = None
+    primer_volume_pct_solids: Optional[float] = None
+    primer_wt_pct_zinc_dft: Optional[float] = None
+    intermediate_coat_product: Optional[str] = None
+    intermediate_coat_dft_low_mils: Optional[float] = None
+    intermediate_coat_dft_high_mils: Optional[float] = None
+    intermediate_coat_color: Optional[str] = None
+    intermediate_coat_volume_pct_solids: Optional[float] = None
+    top_coat_product: Optional[str] = None
+    top_coat_dft_low_mils: Optional[float] = None
+    top_coat_dft_high_mils: Optional[float] = None
+    top_coat_volume_pct_solids: Optional[str] = None
+    bottom_total_dft_system: Optional[float] = None
+    top_total_dft_system: Optional[float] = None
+    top_coat_paint_shade: Optional[str] = None
 
 class AuditEntry(BaseModel):
     id: str
@@ -429,9 +476,20 @@ COATING_SPEC_CATALOG = {
 }
 
 
-@api.get("/coating-specifications", response_model=List[CoatingSpecOut])
+@api.get("/coating-specifications", response_model=List[PaintSystemSpec])
 async def list_coating_specs(_=Depends(get_current_user)):
-    return [CoatingSpecOut(code=k, name=v["name"], spec=PaintSpec(**v["spec"])) for k, v in COATING_SPEC_CATALOG.items()]
+    """Serves paint_system_specifications rows imported from MVG040014N.xlsx (Supabase).
+
+    NOTE: `specification` codes are not unique here (one code can have several
+    system/paint-brand rows) — this endpoint just lists all rows. Work-order
+    creation still validates against the old COATING_SPEC_CATALOG below; that
+    still needs to be reconciled with this table (see accompanying summary).
+    """
+    if supabase is None:
+        raise HTTPException(500, "Supabase not configured (SUPABASE_URL/SUPABASE_KEY missing)")
+    res = supabase.table("paint_system_specifications").select("*").execute()
+    rows = cast(List[dict], res.data)
+    return [PaintSystemSpec(**row) for row in rows]
 
 
 async def _next_wo_id() -> str:
