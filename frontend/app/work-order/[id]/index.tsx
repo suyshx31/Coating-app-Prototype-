@@ -94,7 +94,9 @@ export default function WorkOrderDetailScreen() {
             </View>
             <View style={styles.specBox}>
               <Text style={type.caption}>SALTS MAX</Text>
-              <Text style={[type.mono, { marginTop: 2 }]}>≤ {wo.spec.soluble_salts_max_mg_m2} mg/m²</Text>
+              <Text style={[type.mono, { marginTop: 2 }]}>
+                {wo.spec.soluble_salts_max_mg_m2 != null ? `≤ ${wo.spec.soluble_salts_max_mg_m2} mg/m²` : "No limit in spec"}
+              </Text>
             </View>
           </View>
         </Card>

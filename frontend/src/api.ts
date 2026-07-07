@@ -71,10 +71,31 @@ export const api = {
     request<WorkOrderSummary>(`/work-orders`, { method: "POST", body: JSON.stringify(body) }),
 };
 
+// Row from Supabase paint_system_specifications (imported spec sheet).
+// One specification code can appear in several rows (per system/brand),
+// so `id` is the unique handle.
 export type CoatingSpec = {
-  code: string;
-  name: string;
-  spec: PaintSpec;
+  id: string;
+  specification: string;
+  spec_rev: string | null;
+  surface_preparation: string | null;
+  section: string | null;
+  system_number: number | null;
+  application_service_category: string | null;
+  anchor_profile_mils: string | null;
+  paint_brand: string | null;
+  top_coat_ral_shade: number | null;
+  primer_paint_product: string | null;
+  primer_coat_dft_low_mils: number | null;
+  primer_coat_dft_high_mils: number | null;
+  intermediate_coat_product: string | null;
+  intermediate_coat_dft_low_mils: number | null;
+  intermediate_coat_dft_high_mils: number | null;
+  top_coat_product: string | null;
+  top_coat_dft_low_mils: number | null;
+  top_coat_dft_high_mils: number | null;
+  bottom_total_dft_system: number | null;
+  top_total_dft_system: number | null;
 };
 
 export type CreateWorkOrderBody = {
@@ -86,6 +107,7 @@ export type CreateWorkOrderBody = {
   part_revision_number: string;
   coating_spec_code: string;
   coating_spec_revision_number: string;
+  paint_system_id?: string;
   quantity: number;
   confirm_duplicate?: boolean;
 };
@@ -120,7 +142,8 @@ export type PaintSpec = {
   surface_profile_max_um: number;
   dft_min_um: number;
   dft_max_um: number;
-  soluble_salts_max_mg_m2: number;
+  // null = spec defines no soluble-salts limit (paint-system imports); check skipped
+  soluble_salts_max_mg_m2: number | null;
 };
 
 export type Stage = {

@@ -93,7 +93,9 @@ class PaintSpec(BaseModel):
     surface_profile_max_um: float
     dft_min_um: float
     dft_max_um: float
-    soluble_salts_max_mg_m2: float
+    # Paint-system specs imported from Excel carry no soluble-salts limit;
+    # None means "no limit defined in spec" and the check is skipped.
+    soluble_salts_max_mg_m2: Optional[float] = None
 
 class WorkOrderSummary(BaseModel):
     work_order_id: str
@@ -146,6 +148,9 @@ class CreateWorkOrderRequest(BaseModel):
     part_revision_number: str = Field(..., min_length=1)
     coating_spec_code: str = Field(..., min_length=1)    # must reference a known spec
     coating_spec_revision_number: str = Field(..., min_length=1)
+    # Supabase paint_system_specifications.id — spec codes repeat across
+    # brands/systems, so the picked row is identified by its uuid.
+    paint_system_id: Optional[str] = None
     quantity: int = Field(..., ge=1)
     confirm_duplicate: bool = False  # set to True to override the duplicate guard
 
@@ -156,6 +161,7 @@ class CoatingSpecOut(BaseModel):
 
 class PaintSystemSpec(BaseModel):
     """Row from Supabase `paint_system_specifications` (imported from MVG040014N.xlsx)."""
+    id: str
     specification: str
     spec_rev: Optional[str] = None
     surface_preparation: Optional[str] = None
@@ -492,6 +498,41 @@ async def list_coating_specs(_=Depends(get_current_user)):
     return [PaintSystemSpec(**row) for row in rows]
 
 
+MILS_TO_UM = 25.4
+
+
+def _spec_from_paint_system_row(row: dict) -> dict:
+    """Derive the µm limits used by stage validation from a paint-system row.
+
+    Converts mils → µm (×25.4). The imported spec sheet has no soluble-salts
+    limit, so that stays None and the salts check is skipped for these WOs.
+    """
+    try:
+        lo_str, hi_str = str(row["anchor_profile_mils"]).split("-", 1)
+        sp_min_um = float(lo_str) * MILS_TO_UM
+        sp_max_um = float(hi_str) * MILS_TO_UM
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(
+            400, f"Paint system row has unusable anchor profile: {row.get('anchor_profile_mils')!r}"
+        )
+    if row.get("bottom_total_dft_system") is None or row.get("top_total_dft_system") is None:
+        raise HTTPException(400, "Paint system row lacks total DFT limits")
+    return {
+        "surface_profile_min_um": round(sp_min_um, 1),
+        "surface_profile_max_um": round(sp_max_um, 1),
+        "dft_min_um": round(float(row["bottom_total_dft_system"]) * MILS_TO_UM, 1),
+        "dft_max_um": round(float(row["top_total_dft_system"]) * MILS_TO_UM, 1),
+        "soluble_salts_max_mg_m2": None,
+    }
+
+
+def _paint_system_product_name(row: dict) -> str:
+    coats = [row.get("primer_paint_product"), row.get("intermediate_coat_product"), row.get("top_coat_product")]
+    chain = " → ".join(c for c in coats if c)
+    brand = row.get("paint_brand") or ""
+    return f"{brand}: {chain}" if brand and chain else (chain or brand or row.get("specification", ""))
+
+
 async def _next_wo_id() -> str:
     """Atomically generate the next WO-YYYY-NNNN id for the current year."""
     year = datetime.now(timezone.utc).year
@@ -508,10 +549,24 @@ async def _next_wo_id() -> str:
 
 @api.post("/work-orders", response_model=WorkOrderSummary, status_code=201)
 async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_current_user)):
-    # validate coating spec exists in the catalog
-    if body.coating_spec_code not in COATING_SPEC_CATALOG:
+    # Resolve the coating spec: Supabase paint-system row (new path, picked by
+    # row id) or the legacy hardcoded catalog (kept for the seeded mock WOs).
+    if body.paint_system_id:
+        if supabase is None:
+            raise HTTPException(500, "Supabase not configured (SUPABASE_URL/SUPABASE_KEY missing)")
+        res = supabase.table("paint_system_specifications").select("*").eq("id", body.paint_system_id).execute()
+        ps_rows = cast(List[dict], res.data)
+        if not ps_rows:
+            raise HTTPException(400, f"Unknown paint system id '{body.paint_system_id}'")
+        ps_row = ps_rows[0]
+        spec_name = _paint_system_product_name(ps_row)
+        spec_limits = _spec_from_paint_system_row(ps_row)
+    elif body.coating_spec_code in COATING_SPEC_CATALOG:
+        catalog = COATING_SPEC_CATALOG[body.coating_spec_code]
+        spec_name = catalog["name"]
+        spec_limits = catalog["spec"]
+    else:
         raise HTTPException(400, f"Unknown coating specification '{body.coating_spec_code}'")
-    catalog = COATING_SPEC_CATALOG[body.coating_spec_code]
 
     # duplicate guard: same PO + line item + part + revision = likely the same job
     if not body.confirm_duplicate:
@@ -561,12 +616,13 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
         "po_number": body.po_number,
         "customer_name": body.customer_name,
         "paint_product_code": body.coating_spec_code,
-        "paint_product_name": catalog["name"],
+        "paint_product_name": spec_name,
         "part_description": part_description,
         "quantity": body.quantity,
         "serial_range": f"{body.part_number}-001 → {body.part_number}-{body.quantity:03d}",
         "priority": False,
-        "spec": catalog["spec"],
+        "spec": spec_limits,
+        "paint_system_id": body.paint_system_id,
         # new fields introduced by the Create-WO feature
         "customer_address": body.customer_address or "",
         "po_line_item_number": body.po_line_item_number,
@@ -660,8 +716,9 @@ async def submit_stage(
     if p.dft_um > spec["dft_max_um"]:
         # hard block
         errors.append(f"DFT {p.dft_um} \u00b5m exceeds max {spec['dft_max_um']} \u00b5m (hard block)")
-    if p.soluble_salts_mg_m2 > spec["soluble_salts_max_mg_m2"]:
-        errors.append(f"Soluble salts {p.soluble_salts_mg_m2} mg/m\u00b2 exceeds max {spec['soluble_salts_max_mg_m2']}")
+    salts_max = spec.get("soluble_salts_max_mg_m2")
+    if salts_max is not None and p.soluble_salts_mg_m2 > salts_max:
+        errors.append(f"Soluble salts {p.soluble_salts_mg_m2} mg/m\u00b2 exceeds max {salts_max}")
 
     # gate check on END readings (final condition)
     end = body.readings.end

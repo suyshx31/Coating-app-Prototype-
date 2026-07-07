@@ -126,6 +126,7 @@ export default function StageFormScreen() {
     if (!wo) return null;
     const v = n(salts);
     if (v == null) return null;
+    if (wo.spec.soluble_salts_max_mg_m2 == null) return null; // spec defines no salts limit
     if (v > wo.spec.soluble_salts_max_mg_m2) return `Exceeds max ${wo.spec.soluble_salts_max_mg_m2} mg/m²`;
     return null;
   }, [salts, wo]);
@@ -331,7 +332,7 @@ export default function StageFormScreen() {
             <View style={{ marginTop: spacing.md }}>
               <View style={styles.rowBetween}>
                 <Text style={[type.label, { color: colors.textPrimary }]}>SOLUBLE SALTS (mg/m²)</Text>
-                <Text style={type.caption}>Max {wo.spec.soluble_salts_max_mg_m2}</Text>
+                <Text style={type.caption}>{wo.spec.soluble_salts_max_mg_m2 != null ? `Max ${wo.spec.soluble_salts_max_mg_m2}` : "No limit in spec"}</Text>
               </View>
               <TextInput
                 testID="param-salts-input"

@@ -29,6 +29,7 @@ type Form = {
   part_revision_number: string;
   coating_spec_code: string;
   coating_spec_revision_number: string;
+  paint_system_id: string;
   quantity: string;
 };
 
@@ -41,6 +42,7 @@ const initial: Form = {
   part_revision_number: "",
   coating_spec_code: "",
   coating_spec_revision_number: "",
+  paint_system_id: "",
   quantity: "",
 };
 
@@ -80,7 +82,7 @@ export default function NewWorkOrderScreen() {
     else if (!/^\d+$/.test(form.po_line_item_number) || Number(form.po_line_item_number) < 1) e.po_line_item_number = "Whole number ≥ 1";
     if (!form.part_number.trim()) e.part_number = "Required";
     if (!form.part_revision_number.trim()) e.part_revision_number = "Required";
-    if (!form.coating_spec_code) e.coating_spec_code = "Pick a spec";
+    if (!form.paint_system_id) e.coating_spec_code = "Pick a spec";
     if (!form.coating_spec_revision_number.trim()) e.coating_spec_revision_number = "Required";
     if (!form.quantity.trim()) e.quantity = "Required";
     else if (!/^\d+$/.test(form.quantity) || Number(form.quantity) < 1) e.quantity = "Whole number ≥ 1";
@@ -98,6 +100,7 @@ export default function NewWorkOrderScreen() {
     part_revision_number: form.part_revision_number.trim(),
     coating_spec_code: form.coating_spec_code,
     coating_spec_revision_number: form.coating_spec_revision_number.trim(),
+    paint_system_id: form.paint_system_id,
     quantity: Number(form.quantity),
   });
 
@@ -125,9 +128,11 @@ export default function NewWorkOrderScreen() {
     await doCreate(false);
   };
 
-  const pickedSpec = specs.find((s) => s.code === form.coating_spec_code);
+  const pickedSpec = specs.find((s) => s.id === form.paint_system_id);
   const filteredSpecs = specs.filter((s) =>
-    `${s.code} ${s.name}`.toLowerCase().includes(specSearch.toLowerCase()),
+    `${s.specification} ${s.paint_brand ?? ""} ${s.application_service_category ?? ""} ${s.primer_paint_product ?? ""} ${s.top_coat_product ?? ""}`
+      .toLowerCase()
+      .includes(specSearch.toLowerCase()),
   );
 
   return (
@@ -227,8 +232,12 @@ export default function NewWorkOrderScreen() {
             >
               {pickedSpec ? (
                 <View style={{ flex: 1 }}>
-                  <Text style={[type.body, { fontWeight: "700" }]}>{pickedSpec.code}</Text>
-                  <Text style={[type.caption, { marginTop: 2 }]}>{pickedSpec.name}</Text>
+                  <Text style={[type.body, { fontWeight: "700" }]}>
+                    {pickedSpec.specification}{pickedSpec.spec_rev ? ` · Rev ${pickedSpec.spec_rev}` : ""}
+                  </Text>
+                  <Text style={[type.caption, { marginTop: 2 }]}>
+                    {[pickedSpec.paint_brand, pickedSpec.application_service_category].filter(Boolean).join(" — ")}
+                  </Text>
                 </View>
               ) : (
                 <Text style={[type.body, { color: colors.textMuted, flex: 1 }]}>
@@ -243,9 +252,24 @@ export default function NewWorkOrderScreen() {
 
             {pickedSpec ? (
               <View style={styles.specSummary} testID="picked-spec-summary">
-                <SpecRow label="Surface Profile" value={`${pickedSpec.spec.surface_profile_min_um}–${pickedSpec.spec.surface_profile_max_um} µm`} />
-                <SpecRow label="DFT" value={`${pickedSpec.spec.dft_min_um}–${pickedSpec.spec.dft_max_um} µm`} />
-                <SpecRow label="Salts" value={`≤ ${pickedSpec.spec.soluble_salts_max_mg_m2} mg/m²`} />
+                <SpecRow label="Surface Prep" value={pickedSpec.surface_preparation ?? "—"} />
+                <SpecRow label="Anchor Profile" value={pickedSpec.anchor_profile_mils ? `${pickedSpec.anchor_profile_mils} mils` : "—"} />
+                <SpecRow
+                  label="Total DFT"
+                  value={
+                    pickedSpec.bottom_total_dft_system != null && pickedSpec.top_total_dft_system != null
+                      ? `${pickedSpec.bottom_total_dft_system}–${pickedSpec.top_total_dft_system} mils`
+                      : "—"
+                  }
+                />
+                <SpecRow
+                  label="Coats"
+                  value={
+                    [pickedSpec.primer_paint_product, pickedSpec.intermediate_coat_product, pickedSpec.top_coat_product]
+                      .filter(Boolean)
+                      .join(" → ") || "—"
+                  }
+                />
               </View>
             ) : null}
 
@@ -422,20 +446,36 @@ export default function NewWorkOrderScreen() {
                 <Text style={[type.bodySm, { textAlign: "center", padding: spacing.lg }]}>No specs match.</Text>
               ) : (
                 filteredSpecs.map((s) => {
-                  const selected = s.code === form.coating_spec_code;
+                  const selected = s.id === form.paint_system_id;
+                  const coats = [s.primer_paint_product, s.intermediate_coat_product, s.top_coat_product].filter(Boolean).join(" → ");
                   return (
                     <TouchableOpacity
-                      key={s.code}
-                      testID={`spec-option-${s.code}`}
-                      onPress={() => { set("coating_spec_code", s.code); blur("coating_spec_code"); setShowSpecPicker(false); }}
+                      key={s.id}
+                      testID={`spec-option-${s.id}`}
+                      onPress={() => {
+                        set("paint_system_id", s.id);
+                        set("coating_spec_code", s.specification);
+                        if (s.spec_rev && !form.coating_spec_revision_number.trim()) {
+                          set("coating_spec_revision_number", s.spec_rev);
+                        }
+                        blur("coating_spec_code");
+                        setShowSpecPicker(false);
+                      }}
                       style={[styles.specOption, selected && { backgroundColor: colors.bg, borderColor: colors.brand }]}
                       activeOpacity={0.85}
                     >
                       <View style={{ flex: 1 }}>
-                        <Text style={[type.body, { fontWeight: "700" }]}>{s.code}</Text>
-                        <Text style={[type.caption, { marginTop: 2 }]}>{s.name}</Text>
+                        <Text style={[type.body, { fontWeight: "700" }]}>
+                          {s.specification}{s.spec_rev ? ` · Rev ${s.spec_rev}` : ""}
+                        </Text>
+                        <Text style={[type.caption, { marginTop: 2 }]}>
+                          {[s.paint_brand, s.application_service_category].filter(Boolean).join(" — ") || "—"}
+                        </Text>
                         <Text style={[type.caption, { marginTop: 4 }]}>
-                          SP {s.spec.surface_profile_min_um}–{s.spec.surface_profile_max_um}µm · DFT {s.spec.dft_min_um}–{s.spec.dft_max_um}µm · Salts ≤{s.spec.soluble_salts_max_mg_m2}
+                          {coats ? `${coats} · ` : ""}
+                          {s.bottom_total_dft_system != null && s.top_total_dft_system != null
+                            ? `DFT ${s.bottom_total_dft_system}–${s.top_total_dft_system} mils`
+                            : ""}
                         </Text>
                       </View>
                       {selected ? <Ionicons name="checkmark-circle" size={20} color={colors.successText} /> : null}
