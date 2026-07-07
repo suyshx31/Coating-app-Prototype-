@@ -186,7 +186,7 @@ export default function NewWorkOrderScreen() {
               placeholder="e.g. 1"
             />
             <Text style={[type.caption, { marginTop: spacing.xs }]}>
-              The customer's PO and line item — separate from the internal WO-YYYY-NNNN ID we generate.
+              The customer&apos;s PO and line item — separate from the internal WO-YYYY-NNNN ID we generate.
             </Text>
           </Card>
 

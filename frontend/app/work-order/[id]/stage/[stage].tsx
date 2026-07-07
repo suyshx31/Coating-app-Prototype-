@@ -269,7 +269,7 @@ export default function StageFormScreen() {
               <Ionicons name={gate.ok ? "checkmark-circle" : "alert-circle"} size={16} color={gate.ok ? colors.successText : colors.errorText} />
               <View style={{ flex: 1 }}>
                 <Text style={[type.label, { color: gate.ok ? colors.successText : colors.errorText }]}>
-                  GATE · Surface Temp > Dew Point + 3°C
+                  GATE · Surface Temp &gt; Dew Point + 3°C
                 </Text>
                 <Text style={[type.bodySm, { color: gate.ok ? colors.successText : colors.errorText, marginTop: 2 }]}>
                   {gate.msg}
