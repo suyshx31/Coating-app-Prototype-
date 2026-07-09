@@ -12,7 +12,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -48,6 +48,7 @@ const initial: Form = {
 
 export default function NewWorkOrderScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const [form, setForm] = useState<Form>(initial);
   const [specs, setSpecs] = useState<CoatingSpec[]>([]);
   const [specsLoading, setSpecsLoading] = useState(true);
@@ -310,7 +311,7 @@ export default function NewWorkOrderScreen() {
           </Text>
         </ScrollView>
 
-        <View style={styles.stickyBar}>
+        <View style={[styles.stickyBar, { paddingBottom: spacing.md + insets.bottom }]}>
           <TouchableOpacity
             testID="submit-new-work-order"
             disabled={!canSubmit}
@@ -541,7 +542,8 @@ function SpecRow({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.specRow}>
       <Text style={type.caption}>{label.toUpperCase()}</Text>
-      <Text style={[type.mono]}>{value}</Text>
+      {/* flexShrink + right align keeps long product chains wrapping inside the box */}
+      <Text style={[type.mono, { flexShrink: 1, textAlign: "right", marginLeft: spacing.sm }]}>{value}</Text>
     </View>
   );
 }
@@ -564,7 +566,7 @@ const styles = StyleSheet.create({
   inlineErr: { color: colors.errorText, fontSize: 12, marginTop: 4 },
   pickerRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   specSummary: { marginTop: spacing.sm, padding: spacing.sm, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, backgroundColor: colors.bg, gap: 4 },
-  specRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  specRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
   errorBanner: { marginTop: spacing.md, flexDirection: "row", alignItems: "center", gap: spacing.sm, padding: spacing.md, backgroundColor: colors.errorBg, borderWidth: 1, borderColor: colors.borderError, borderRadius: radius.sharp },
   stickyBar: { padding: spacing.md, backgroundColor: colors.card, borderTopWidth: 1, borderTopColor: colors.border },
   primaryCta: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: colors.brand, paddingVertical: 16, borderRadius: radius.button },

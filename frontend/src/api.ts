@@ -57,6 +57,11 @@ export const api = {
     return request<WorkOrderSummary[]>(`/work-orders${qs.toString() ? `?${qs}` : ""}`);
   },
   workOrder: (id: string) => request<WorkOrderDetail>(`/work-orders/${id}`),
+  startStage: (woId: string, stageKey: string, readings: any) =>
+    request<{ ok: boolean; started_at: string }>(`/work-orders/${woId}/stages/${stageKey}/start`, {
+      method: "POST",
+      body: JSON.stringify({ readings }),
+    }),
   submitStage: (woId: string, stageKey: string, body: any) =>
     request<any>(`/work-orders/${woId}/stages/${stageKey}/submit`, {
       method: "POST",
@@ -146,6 +151,13 @@ export type PaintSpec = {
   soluble_salts_max_mg_m2: number | null;
 };
 
+export type StageReadings = {
+  ambient_temp_c: number | null;
+  relative_humidity_pct: number | null;
+  dew_point_c: number | null;
+  surface_temp_c: number | null;
+};
+
 export type Stage = {
   key: string;
   name: string;
@@ -153,13 +165,26 @@ export type Stage = {
   requires_coat_readings: boolean;
   status: "pending" | "in_progress" | "done" | "fail";
   result: "pass" | "fail" | null;
+  submission: any | null;
   submitted_at: string | null;
   submitted_by: string | null;
+  started_at: string | null;
+  started_by: string | null;
+  start_readings: StageReadings | null;
+};
+
+// Cumulative DFT windows (µm) per coat stage, from the paint-system spec.
+export type CoatLimits = {
+  primer: [number, number] | null;
+  intermediate: [number, number] | null;
+  mid_cumulative: [number, number] | null;
+  total: [number, number] | null;
 };
 
 export type WorkOrderDetail = WorkOrderSummary & {
   po_number: string;
   spec: PaintSpec;
+  coat_limits: CoatLimits | null;
   stages: Stage[];
 };
 

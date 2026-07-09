@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { ScrollView, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
@@ -11,6 +11,7 @@ import { Card, DataId, Label, StatusPill, Divider } from "@/src/components/UI";
 export default function WorkOrderDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const [wo, setWo] = useState<WorkOrderDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
@@ -154,7 +155,7 @@ export default function WorkOrderDetailScreen() {
         </TouchableOpacity>
       </ScrollView>
 
-      <View style={styles.stickyBar}>
+      <View style={[styles.stickyBar, { paddingBottom: spacing.md + insets.bottom }]}>
         <TouchableOpacity
           testID="update-selected-stage"
           disabled={!selectedStage}
