@@ -1,42 +1,42 @@
-"""Coating Portal backend — FastAPI + MongoDB.
+"""Coating Portal backend — FastAPI + PostgreSQL (Supabase).
 
 Implements the domain model from the spec:
-- purchase_order / purchase_order_line (work order, fixed WO-YYYY-NNNN id)
-- operator (inspector), paint_product, paint_specification, gauge
-- Inspection / InspectionStage (6 stages)
-- WeatherReading (API-sourced) + SurfaceTemperatureReading (manual Elcometer)
-  captured as a start/end pair per coat-stage
-- MeasuredParameter (Surface Profile µm, DFT µm with min+max hard-block, Soluble Salts mg/m^2)
-- AuditLogEntry for traceability
+- work_orders / work_order_stages (6-stage workflow, WO-YYYY-NNNN ids)
+- inspectors (JWT email/password auth), audit_log, quota, wo_counters
+- paint_system_specifications (imported from MVG040014N.xlsx) drives the
+  coating-spec picker and per-coat DFT validation windows
+- WeatherReading (API-sourced, mocked) + manual surface temperature captured
+  as separate start-of-stage and end-of-stage submissions
+- MeasuredParameter validation is stage-specific (STAGE_PARAMS): surface
+  profile + soluble salts at surface prep, cumulative DFT at coat stages,
+  observational only at curing / final QC. DFT over max hard-blocks.
 
 Auth: JWT email/password (Entra ID deferred to real Spring Boot backend).
 """
 
+import json
 import logging
 import os
 import random
-import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Literal, Optional, cast
+from typing import List, Literal, Optional
 
+import asyncpg
 import jwt
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, APIRouter, HTTPException, status
+from fastapi import Depends, FastAPI, APIRouter, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from motor.motor_asyncio import AsyncIOMotorClient
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
-from supabase import create_client, Client as SupabaseClient
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 # ---------- config ----------
-MONGO_URL = os.environ["MONGO_URL"]
-DB_NAME = os.environ["DB_NAME"]
+DATABASE_URL = os.environ["DATABASE_URL"]  # Supabase Postgres, direct 5432 connection
 JWT_SECRET = os.environ.get("JWT_SECRET", "coating-portal-dev-secret-change-me")
 JWT_ALG = "HS256"
 JWT_EXP_HOURS = 12
@@ -44,17 +44,7 @@ JWT_EXP_HOURS = 12
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer = HTTPBearer(auto_error=False)
 
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
-
-# ---------- supabase ----------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-supabase: Optional[SupabaseClient] = (
-    create_client(SUPABASE_URL, SUPABASE_KEY)
-    if SUPABASE_URL and SUPABASE_KEY
-    else None
-)
+pool: Optional[asyncpg.Pool] = None
 
 # ---------- stages ----------
 STAGES = [
@@ -62,10 +52,25 @@ STAGES = [
     {"key": "primer_coat",      "name": "Primer Coat",      "description": "Epoxy base application",                 "requires_coat_readings": True},
     {"key": "mid_inspection",   "name": "Mid-Inspection",   "description": "Thickness uniformity check",             "requires_coat_readings": False},
     {"key": "top_coat",         "name": "Top Coat",         "description": "Finish layer application",               "requires_coat_readings": True},
-    {"key": "curing",           "name": "Curing Process",   "description": "Oven cycle: 200\u00b0C for 45 mins",     "requires_coat_readings": False},
+    {"key": "curing",           "name": "Curing Process",   "description": "Oven cycle: 200°C for 45 mins",     "requires_coat_readings": False},
     {"key": "final_qc",         "name": "Final QC",         "description": "Visual and adherence testing",           "requires_coat_readings": False},
 ]
 STAGE_KEYS = [s["key"] for s in STAGES]
+
+# Which measured parameters each stage requires. DFT readings are cumulative
+# film build: primer stage checks the primer window, mid-inspection the
+# primer(+intermediate) window, top coat the total-system window.
+# curing / final_qc are observational (notes, photos, result only).
+STAGE_PARAMS: dict = {
+    "surface_prep":   ["surface_profile_um", "soluble_salts_mg_m2"],
+    "primer_coat":    ["dft_um"],
+    "mid_inspection": ["dft_um"],
+    "top_coat":       ["dft_um"],
+    "curing":         [],
+    "final_qc":       [],
+}
+
+MILS_TO_UM = 25.4
 
 
 # ---------- models ----------
@@ -113,6 +118,10 @@ class WorkOrderSummary(BaseModel):
 class WorkOrderDetail(WorkOrderSummary):
     po_number: str
     spec: PaintSpec
+    # Per-coat cumulative DFT windows in µm, derived from the paint-system row
+    # at creation: {"primer": [lo,hi], "intermediate": [lo,hi]|None,
+    # "mid_cumulative": [lo,hi]|None, "total": [lo,hi]}. None for legacy WOs.
+    coat_limits: Optional[dict] = None
     stages: List[dict]
 
 class StageReadings(BaseModel):
@@ -124,17 +133,24 @@ class StageReadings(BaseModel):
     surface_temp_c: Optional[float] = None
 
 class StageReadingPair(BaseModel):
-    start: StageReadings
-    end: StageReadings
+    # start is optional: with the two-step flow the start readings were
+    # already stored by POST .../start; a full pair is still accepted for
+    # single-shot (legacy/offline) submissions.
+    start: Optional[StageReadings] = None
+    end: StageReadings = Field(default_factory=StageReadings)
 
 class MeasuredParameters(BaseModel):
-    surface_profile_um: float
-    dft_um: float
-    soluble_salts_mg_m2: float
+    # All optional — which ones are required depends on the stage (STAGE_PARAMS).
+    surface_profile_um: Optional[float] = None
+    dft_um: Optional[float] = None
+    soluble_salts_mg_m2: Optional[float] = None
+
+class StageStartRequest(BaseModel):
+    readings: StageReadings = Field(default_factory=StageReadings)
 
 class StageSubmission(BaseModel):
     readings: StageReadingPair
-    parameters: MeasuredParameters
+    parameters: MeasuredParameters = Field(default_factory=MeasuredParameters)
     notes: Optional[str] = ""
     photos: List[str] = Field(default_factory=list)  # base64 strings
     result: Literal["pass", "fail"] = "pass"
@@ -146,21 +162,16 @@ class CreateWorkOrderRequest(BaseModel):
     po_line_item_number: int = Field(..., ge=1)          # which line within that PO
     part_number: str = Field(..., min_length=1)
     part_revision_number: str = Field(..., min_length=1)
-    coating_spec_code: str = Field(..., min_length=1)    # must reference a known spec
+    coating_spec_code: str = Field(..., min_length=1)
     coating_spec_revision_number: str = Field(..., min_length=1)
-    # Supabase paint_system_specifications.id — spec codes repeat across
-    # brands/systems, so the picked row is identified by its uuid.
-    paint_system_id: Optional[str] = None
+    # paint_system_specifications.id — spec codes repeat across brands/systems,
+    # so the picked row is identified by its uuid.
+    paint_system_id: str = Field(..., min_length=1)
     quantity: int = Field(..., ge=1)
     confirm_duplicate: bool = False  # set to True to override the duplicate guard
 
-class CoatingSpecOut(BaseModel):
-    code: str
-    name: str
-    spec: PaintSpec
-
 class PaintSystemSpec(BaseModel):
-    """Row from Supabase `paint_system_specifications` (imported from MVG040014N.xlsx)."""
+    """Row from `paint_system_specifications` (imported from MVG040014N.xlsx)."""
     id: str
     specification: str
     spec_rev: Optional[str] = None
@@ -221,6 +232,9 @@ class HistoryItem(BaseModel):
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.astimezone(timezone.utc).isoformat() if dt else None
+
 def make_token(user: dict) -> str:
     payload = {
         "sub": user["email"],
@@ -229,6 +243,20 @@ def make_token(user: dict) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
+
+def _inspector_public(row) -> dict:
+    return {
+        "id": str(row["id"]),
+        "employee_id": row["employee_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "role": row["role"],
+        "shift": row["shift"],
+        "department": row["department"],
+        "avatar_url": row["avatar_url"],
+    }
+
+
 async def get_current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)) -> dict:
     if creds is None:
         raise HTTPException(status_code=401, detail="Missing auth token")
@@ -236,23 +264,20 @@ async def get_current_user(creds: Optional[HTTPAuthorizationCredentials] = Depen
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    user = await db.inspectors.find_one({"email": payload.get("sub")}, {"_id": 0, "password_hash": 0})
-    if not user:
+    assert pool is not None
+    row = await pool.fetchrow("select * from inspectors where email = $1", payload.get("sub"))
+    if not row:
         raise HTTPException(status_code=401, detail="User not found")
-    return user
+    return _inspector_public(row)
+
 
 async def write_audit(work_order_id: str, stage_key: Optional[str], actor: dict, action: str, detail: str):
-    entry = {
-        "id": str(uuid.uuid4()),
-        "work_order_id": work_order_id,
-        "stage_key": stage_key,
-        "actor_employee_id": actor["employee_id"],
-        "actor_name": actor["name"],
-        "action": action,
-        "detail": detail,
-        "timestamp": now_iso(),
-    }
-    await db.audit_log.insert_one(entry.copy())
+    assert pool is not None
+    await pool.execute(
+        """insert into audit_log (work_order_id, stage_key, actor_employee_id, actor_name, action, detail)
+           values ($1, $2, $3, $4, $5, $6)""",
+        work_order_id, stage_key, actor["employee_id"], actor["name"], action, detail,
+    )
 
 
 def stage_progress(stages: List[dict]) -> tuple[int, str]:
@@ -266,239 +291,6 @@ def stage_progress(stages: List[dict]) -> tuple[int, str]:
     if in_progress or done > 0:
         return done, "in_progress"
     return done, "pending"
-
-
-# ---------- seed ----------
-async def seed_data():
-    # Inspectors
-    if await db.inspectors.count_documents({}) == 0:
-        inspectors = [
-            {
-                "id": str(uuid.uuid4()),
-                "employee_id": "QC-7742",
-                "name": "Thompson, J.",
-                "email": "j.thompson@aerospace-precision.com",
-                "password_hash": pwd_ctx.hash("Inspector@123"),
-                "role": "Lead Inspector",
-                "shift": "Alpha - Section 4",
-                "department": "Surface Coating & Prep",
-                "avatar_url": "https://images.pexels.com/photos/10816007/pexels-photo-10816007.jpeg",
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "employee_id": "QC-7841",
-                "name": "Reyes, M.",
-                "email": "m.reyes@aerospace-precision.com",
-                "password_hash": pwd_ctx.hash("Inspector@123"),
-                "role": "Inspector",
-                "shift": "Bravo - Section 2",
-                "department": "Surface Coating & Prep",
-                "avatar_url": "https://images.pexels.com/photos/29852895/pexels-photo-29852895.jpeg",
-            },
-        ]
-        await db.inspectors.insert_many([i.copy() for i in inspectors])
-
-    # Paint specs (per-customer-product spec)
-    specs = {
-        "EPOXY-COAT-X": {"surface_profile_min_um": 50, "surface_profile_max_um": 100,
-                         "dft_min_um": 250, "dft_max_um": 400, "soluble_salts_max_mg_m2": 20},
-        "POLY-SHIELD-40": {"surface_profile_min_um": 40, "surface_profile_max_um": 90,
-                           "dft_min_um": 200, "dft_max_um": 350, "soluble_salts_max_mg_m2": 20},
-        "ZINC-GALV-XL":  {"surface_profile_min_um": 60, "surface_profile_max_um": 120,
-                          "dft_min_um": 300, "dft_max_um": 500, "soluble_salts_max_mg_m2": 15},
-        "MARINE-GUARD":  {"surface_profile_min_um": 45, "surface_profile_max_um": 95,
-                          "dft_min_um": 275, "dft_max_um": 425, "soluble_salts_max_mg_m2": 18},
-    }
-
-    # Work orders
-    if await db.work_orders.count_documents({}) == 0:
-        seed_wos = [
-            {
-                "work_order_id": "WO-2024-9901",
-                "po_number": "PO-AC-44821",
-                "customer_name": "Aerospace Precision Corp.",
-                "paint_product_code": "EPOXY-COAT-X",
-                "paint_product_name": "Epoxy Coat X (Aerospace Grade)",
-                "part_description": "Aerospace Chassis - Component Batch A-92",
-                "quantity": 24,
-                "serial_range": "AP-2024-0801 \u2192 AP-2024-0824",
-                "priority": True,
-            },
-            {
-                "work_order_id": "WO-2024-9905",
-                "po_number": "PO-TD-10994",
-                "customer_name": "Titan Dynamics Ltd.",
-                "paint_product_code": "POLY-SHIELD-40",
-                "paint_product_name": "Poly-Shield 40 Industrial Topcoat",
-                "part_description": "Drilling Riser Joint - Lot R12",
-                "quantity": 12,
-                "serial_range": "TD-R12-0301 \u2192 TD-R12-0312",
-                "priority": False,
-            },
-            {
-                "work_order_id": "WO-2024-9912",
-                "po_number": "PO-GH-77123",
-                "customer_name": "Global Hydraulics",
-                "paint_product_code": "ZINC-GALV-XL",
-                "paint_product_name": "Zinc-Galv XL Heavy Duty",
-                "part_description": "Subsea Manifold Spool",
-                "quantity": 6,
-                "serial_range": "GH-SMS-401 \u2192 GH-SMS-406",
-                "priority": True,
-            },
-            {
-                "work_order_id": "WO-2024-9920",
-                "po_number": "PO-OM-55021",
-                "customer_name": "Oceanic Marine Svcs",
-                "paint_product_code": "MARINE-GUARD",
-                "paint_product_name": "Marine-Guard Anticorrosive",
-                "part_description": "Wellhead Christmas Tree Assembly",
-                "quantity": 3,
-                "serial_range": "OM-WCT-001 \u2192 OM-WCT-003",
-                "priority": False,
-            },
-        ]
-        # Pre-populate WO-2024-9901 with a couple of completed stages to match the dashboard mock
-        for wo in seed_wos:
-            wo["spec"] = specs[wo["paint_product_code"]]
-            wo["stages"] = [
-                {
-                    "key": s["key"],
-                    "name": s["name"],
-                    "description": s["description"],
-                    "requires_coat_readings": s["requires_coat_readings"],
-                    "status": "pending",
-                    "result": None,
-                    "submission": None,
-                    "submitted_at": None,
-                    "submitted_by": None,
-                }
-                for s in STAGES
-            ]
-            wo["created_at"] = now_iso()
-
-        # pre-mark some progress on the priority order
-        priority_wo = next(w for w in seed_wos if w["work_order_id"] == "WO-2024-9901")
-        for k in ["surface_prep", "primer_coat"]:
-            stg = next(s for s in priority_wo["stages"] if s["key"] == k)
-            stg["status"] = "done"
-            stg["result"] = "pass"
-            stg["submitted_at"] = now_iso()
-            stg["submitted_by"] = "QC-7742"
-
-        await db.work_orders.insert_many([w.copy() for w in seed_wos])
-
-    # daily quota — just a doc keyed to today
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if not await db.quota.find_one({"date": today}):
-        await db.quota.insert_one({"date": today, "completed": 14, "target": 25})
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    await seed_data()
-    yield
-    client.close()
-
-
-# ---------- app ----------
-app = FastAPI(lifespan=lifespan, title="Coating Portal API")
-api = APIRouter(prefix="/api")
-
-
-@api.get("/")
-async def root():
-    return {"name": "Coating Portal API", "ok": True}
-
-
-# auth
-@api.post("/auth/login", response_model=LoginResponse)
-async def login(req: LoginRequest):
-    user = await db.inspectors.find_one({"email": req.email.lower()})
-    if not user or not pwd_ctx.verify(req.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = make_token(user)
-    safe = {k: v for k, v in user.items() if k not in ("_id", "password_hash")}
-    await write_audit("-", None, user, "login", f"Inspector {user['employee_id']} signed in")
-    return {"access_token": token, "token_type": "bearer", "user": safe}
-
-
-@api.get("/auth/me", response_model=InspectorOut)
-async def me(current=Depends(get_current_user)):
-    return InspectorOut(**current)
-
-
-# work orders
-@api.get("/work-orders", response_model=List[WorkOrderSummary])
-async def list_work_orders(
-    q: Optional[str] = None,
-    filter: Optional[str] = None,  # "all" | "priority" | "pending"
-    _=Depends(get_current_user),
-):
-    cursor = db.work_orders.find({}, {"_id": 0}).limit(200)
-    items: List[WorkOrderSummary] = []
-    async for wo in cursor:
-        done, overall = stage_progress(wo["stages"])
-        if filter == "priority" and not wo.get("priority"):
-            continue
-        if filter == "pending" and overall == "done":
-            continue
-        if q:
-            needle = q.lower()
-            hay = " ".join([wo["work_order_id"], wo["customer_name"], wo["paint_product_code"], wo["part_description"]]).lower()
-            if needle not in hay:
-                continue
-        items.append(WorkOrderSummary(
-            work_order_id=wo["work_order_id"],
-            customer_name=wo["customer_name"],
-            paint_product_code=wo["paint_product_code"],
-            paint_product_name=wo["paint_product_name"],
-            part_description=wo["part_description"],
-            quantity=wo["quantity"],
-            serial_range=wo["serial_range"],
-            priority=wo.get("priority", False),
-            progress=done,
-            overall_status=overall,
-        ))
-    # priority first
-    items.sort(key=lambda x: (not x.priority, x.work_order_id))
-    return items
-
-
-# ---- coating specs (used by the New Work Order form) ----
-COATING_SPEC_CATALOG = {
-    "EPOXY-COAT-X":   {"name": "Epoxy Coat X (Aerospace Grade)",
-                       "spec": {"surface_profile_min_um": 50, "surface_profile_max_um": 100,
-                                "dft_min_um": 250, "dft_max_um": 400, "soluble_salts_max_mg_m2": 20}},
-    "POLY-SHIELD-40": {"name": "Poly-Shield 40 Industrial Topcoat",
-                       "spec": {"surface_profile_min_um": 40, "surface_profile_max_um": 90,
-                                "dft_min_um": 200, "dft_max_um": 350, "soluble_salts_max_mg_m2": 20}},
-    "ZINC-GALV-XL":   {"name": "Zinc-Galv XL Heavy Duty",
-                       "spec": {"surface_profile_min_um": 60, "surface_profile_max_um": 120,
-                                "dft_min_um": 300, "dft_max_um": 500, "soluble_salts_max_mg_m2": 15}},
-    "MARINE-GUARD":   {"name": "Marine-Guard Anticorrosive",
-                       "spec": {"surface_profile_min_um": 45, "surface_profile_max_um": 95,
-                                "dft_min_um": 275, "dft_max_um": 425, "soluble_salts_max_mg_m2": 18}},
-}
-
-
-@api.get("/coating-specifications", response_model=List[PaintSystemSpec])
-async def list_coating_specs(_=Depends(get_current_user)):
-    """Serves paint_system_specifications rows imported from MVG040014N.xlsx (Supabase).
-
-    NOTE: `specification` codes are not unique here (one code can have several
-    system/paint-brand rows) — this endpoint just lists all rows. Work-order
-    creation still validates against the old COATING_SPEC_CATALOG below; that
-    still needs to be reconciled with this table (see accompanying summary).
-    """
-    if supabase is None:
-        raise HTTPException(500, "Supabase not configured (SUPABASE_URL/SUPABASE_KEY missing)")
-    res = supabase.table("paint_system_specifications").select("*").execute()
-    rows = cast(List[dict], res.data)
-    return [PaintSystemSpec(**row) for row in rows]
-
-
-MILS_TO_UM = 25.4
 
 
 def _spec_from_paint_system_row(row: dict) -> dict:
@@ -526,6 +318,46 @@ def _spec_from_paint_system_row(row: dict) -> dict:
     }
 
 
+def _coat_limits_from_paint_system_row(row: dict) -> dict:
+    """Per-coat cumulative DFT windows in µm from a paint-system row.
+
+    mid_cumulative assumes the intermediate coat (when the system has one) is
+    applied before mid-inspection, so its window is primer+intermediate summed.
+    """
+    def rng(lo_key: str, hi_key: str):
+        lo, hi = row.get(lo_key), row.get(hi_key)
+        if lo is None or hi is None:
+            return None
+        return [round(float(lo) * MILS_TO_UM, 1), round(float(hi) * MILS_TO_UM, 1)]
+
+    primer = rng("primer_coat_dft_low_mils", "primer_coat_dft_high_mils")
+    intermediate = rng("intermediate_coat_dft_low_mils", "intermediate_coat_dft_high_mils")
+    total = rng("bottom_total_dft_system", "top_total_dft_system")
+    mid = None
+    if primer:
+        mid = [
+            round(primer[0] + (intermediate[0] if intermediate else 0), 1),
+            round(primer[1] + (intermediate[1] if intermediate else 0), 1),
+        ]
+    return {"primer": primer, "intermediate": intermediate, "mid_cumulative": mid, "total": total}
+
+
+def _dft_limits_for_stage(wo: dict, stage_key: str):
+    """Cumulative DFT window (µm) to validate at a given stage; None = no check."""
+    coat = wo.get("coat_limits") or {}
+    window = {
+        "primer_coat": coat.get("primer"),
+        "mid_inspection": coat.get("mid_cumulative"),
+        "top_coat": coat.get("total"),
+    }.get(stage_key)
+    if window:
+        return window[0], window[1]
+    spec = wo.get("spec") or {}
+    if spec.get("dft_min_um") is not None and spec.get("dft_max_um") is not None:
+        return spec["dft_min_um"], spec["dft_max_um"]
+    return None
+
+
 def _paint_system_product_name(row: dict) -> str:
     coats = [row.get("primer_paint_product"), row.get("intermediate_coat_product"), row.get("top_coat_product")]
     chain = " → ".join(c for c in coats if c)
@@ -533,132 +365,352 @@ def _paint_system_product_name(row: dict) -> str:
     return f"{brand}: {chain}" if brand and chain else (chain or brand or row.get("specification", ""))
 
 
-async def _next_wo_id() -> str:
+# ---------- data access ----------
+def _stage_dict(row) -> dict:
+    return {
+        "key": row["stage_key"],
+        "name": row["name"],
+        "description": row["description"],
+        "requires_coat_readings": row["requires_coat_readings"],
+        "status": row["status"],
+        "result": row["result"],
+        "submission": row["submission"],
+        "submitted_at": _iso(row["submitted_at"]),
+        "submitted_by": row["submitted_by"],
+        "started_at": _iso(row["started_at"]),
+        "started_by": row["started_by"],
+        "start_readings": row["start_readings"],
+    }
+
+
+def _wo_dict(row, stages: List[dict]) -> dict:
+    return {
+        "id": str(row["id"]),
+        "work_order_id": row["work_order_id"],
+        "po_number": row["po_number"],
+        "po_line_item_number": row["po_line_item_number"],
+        "customer_name": row["customer_name"],
+        "customer_address": row["customer_address"],
+        "part_number": row["part_number"],
+        "part_revision_number": row["part_revision_number"],
+        "part_description": row["part_description"],
+        "paint_product_code": row["paint_product_code"],
+        "paint_product_name": row["paint_product_name"],
+        "coating_spec_revision_number": row["coating_spec_revision_number"],
+        "quantity": row["quantity"],
+        "serial_range": row["serial_range"],
+        "priority": row["priority"],
+        "spec": {
+            "surface_profile_min_um": float(row["surface_profile_min_um"]),
+            "surface_profile_max_um": float(row["surface_profile_max_um"]),
+            "dft_min_um": float(row["dft_min_um"]),
+            "dft_max_um": float(row["dft_max_um"]),
+            "soluble_salts_max_mg_m2": float(row["soluble_salts_max_mg_m2"]) if row["soluble_salts_max_mg_m2"] is not None else None,
+        },
+        "coat_limits": row["coat_limits"],
+        "paint_system_id": str(row["paint_system_id"]) if row["paint_system_id"] else None,
+        "created_at": _iso(row["created_at"]),
+        "created_by": row["created_by"],
+        "stages": stages,
+    }
+
+
+async def _fetch_work_orders(conn, work_order_id: Optional[str] = None, limit: int = 200) -> List[dict]:
+    """Work orders with their ordered stage lists, shaped like the API expects."""
+    if work_order_id:
+        wo_rows = await conn.fetch("select * from work_orders where work_order_id = $1", work_order_id)
+    else:
+        wo_rows = await conn.fetch("select * from work_orders order by priority desc, work_order_id limit $1", limit)
+    if not wo_rows:
+        return []
+    ids = [r["id"] for r in wo_rows]
+    stage_rows = await conn.fetch(
+        "select * from work_order_stages where work_order_id = any($1::uuid[]) order by stage_order",
+        ids,
+    )
+    by_wo: dict = {}
+    for s in stage_rows:
+        by_wo.setdefault(s["work_order_id"], []).append(_stage_dict(s))
+    return [_wo_dict(r, by_wo.get(r["id"], [])) for r in wo_rows]
+
+
+# ---------- seed ----------
+LEGACY_SPECS = {
+    "EPOXY-COAT-X": {"name": "Epoxy Coat X (Aerospace Grade)",
+                     "surface_profile_min_um": 50, "surface_profile_max_um": 100,
+                     "dft_min_um": 250, "dft_max_um": 400, "soluble_salts_max_mg_m2": 20},
+    "POLY-SHIELD-40": {"name": "Poly-Shield 40 Industrial Topcoat",
+                       "surface_profile_min_um": 40, "surface_profile_max_um": 90,
+                       "dft_min_um": 200, "dft_max_um": 350, "soluble_salts_max_mg_m2": 20},
+    "ZINC-GALV-XL": {"name": "Zinc-Galv XL Heavy Duty",
+                     "surface_profile_min_um": 60, "surface_profile_max_um": 120,
+                     "dft_min_um": 300, "dft_max_um": 500, "soluble_salts_max_mg_m2": 15},
+    "MARINE-GUARD": {"name": "Marine-Guard Anticorrosive",
+                     "surface_profile_min_um": 45, "surface_profile_max_um": 95,
+                     "dft_min_um": 275, "dft_max_um": 425, "soluble_salts_max_mg_m2": 18},
+}
+
+
+async def seed_data():
+    assert pool is not None
+    async with pool.acquire() as conn:
+        if await conn.fetchval("select count(*) from inspectors") == 0:
+            inspectors = [
+                ("QC-7742", "Thompson, J.", "j.thompson@aerospace-precision.com", "Lead Inspector",
+                 "Alpha - Section 4", "Surface Coating & Prep",
+                 "https://images.pexels.com/photos/10816007/pexels-photo-10816007.jpeg"),
+                ("QC-7841", "Reyes, M.", "m.reyes@aerospace-precision.com", "Inspector",
+                 "Bravo - Section 2", "Surface Coating & Prep",
+                 "https://images.pexels.com/photos/29852895/pexels-photo-29852895.jpeg"),
+            ]
+            for emp, name, email, role, shift, dept, avatar in inspectors:
+                await conn.execute(
+                    """insert into inspectors (employee_id, name, email, password_hash, role, shift, department, avatar_url)
+                       values ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                    emp, name, email, pwd_ctx.hash("Inspector@123"), role, shift, dept, avatar,
+                )
+
+        if await conn.fetchval("select count(*) from work_orders") == 0:
+            seed_wos = [
+                ("WO-2024-9901", "PO-AC-44821", "Aerospace Precision Corp.", "EPOXY-COAT-X",
+                 "Aerospace Chassis - Component Batch A-92", 24, "AP-2024-0801 → AP-2024-0824", True),
+                ("WO-2024-9905", "PO-TD-10994", "Titan Dynamics Ltd.", "POLY-SHIELD-40",
+                 "Drilling Riser Joint - Lot R12", 12, "TD-R12-0301 → TD-R12-0312", False),
+                ("WO-2024-9912", "PO-GH-77123", "Global Hydraulics", "ZINC-GALV-XL",
+                 "Subsea Manifold Spool", 6, "GH-SMS-401 → GH-SMS-406", True),
+                ("WO-2024-9920", "PO-OM-55021", "Oceanic Marine Svcs", "MARINE-GUARD",
+                 "Wellhead Christmas Tree Assembly", 3, "OM-WCT-001 → OM-WCT-003", False),
+            ]
+            async with conn.transaction():
+                for wo_id, po, customer, code, part, qty, serials, priority in seed_wos:
+                    spec = LEGACY_SPECS[code]
+                    row_id = await conn.fetchval(
+                        """insert into work_orders
+                             (work_order_id, po_number, customer_name, paint_product_code, paint_product_name,
+                              part_description, quantity, serial_range, priority,
+                              surface_profile_min_um, surface_profile_max_um, dft_min_um, dft_max_um, soluble_salts_max_mg_m2)
+                           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                           returning id""",
+                        wo_id, po, customer, code, spec["name"], part, qty, serials, priority,
+                        spec["surface_profile_min_um"], spec["surface_profile_max_um"],
+                        spec["dft_min_um"], spec["dft_max_um"], spec["soluble_salts_max_mg_m2"],
+                    )
+                    for order, s in enumerate(STAGES, start=1):
+                        # pre-mark progress on the priority order to match the dashboard mock
+                        pre_done = wo_id == "WO-2024-9901" and s["key"] in ("surface_prep", "primer_coat")
+                        await conn.execute(
+                            """insert into work_order_stages
+                                 (work_order_id, stage_key, stage_order, name, description, requires_coat_readings,
+                                  status, result, submitted_at, submitted_by)
+                               values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+                            row_id, s["key"], order, s["name"], s["description"], s["requires_coat_readings"],
+                            "done" if pre_done else "pending", "pass" if pre_done else None,
+                            datetime.now(timezone.utc) if pre_done else None, "QC-7742" if pre_done else None,
+                        )
+
+        await conn.execute(
+            """insert into quota (date, completed, target) values (current_date, 14, 25)
+               on conflict (date) do nothing"""
+        )
+
+
+async def _init_conn(conn):
+    for typ in ("json", "jsonb"):
+        await conn.set_type_codec(typ, encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, init=_init_conn)
+    await seed_data()
+    yield
+    await pool.close()
+
+
+# ---------- app ----------
+app = FastAPI(lifespan=lifespan, title="Coating Portal API")
+api = APIRouter(prefix="/api")
+
+
+@api.get("/")
+async def root():
+    return {"name": "Coating Portal API", "ok": True}
+
+
+# auth
+@api.post("/auth/login", response_model=LoginResponse)
+async def login(req: LoginRequest):
+    assert pool is not None
+    row = await pool.fetchrow("select * from inspectors where email = $1", req.email.lower())
+    if not row or not pwd_ctx.verify(req.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = _inspector_public(row)
+    token = make_token(user)
+    await write_audit("-", None, user, "login", f"Inspector {user['employee_id']} signed in")
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@api.get("/auth/me", response_model=InspectorOut)
+async def me(current=Depends(get_current_user)):
+    return InspectorOut(**current)
+
+
+# work orders
+@api.get("/work-orders", response_model=List[WorkOrderSummary])
+async def list_work_orders(
+    q: Optional[str] = None,
+    filter: Optional[str] = None,  # "all" | "priority" | "pending"
+    _=Depends(get_current_user),
+):
+    assert pool is not None
+    async with pool.acquire() as conn:
+        wos = await _fetch_work_orders(conn)
+    items: List[WorkOrderSummary] = []
+    for wo in wos:
+        done, overall = stage_progress(wo["stages"])
+        if filter == "priority" and not wo.get("priority"):
+            continue
+        if filter == "pending" and overall == "done":
+            continue
+        if q:
+            needle = q.lower()
+            hay = " ".join([wo["work_order_id"], wo["customer_name"], wo["paint_product_code"], wo["part_description"]]).lower()
+            if needle not in hay:
+                continue
+        items.append(WorkOrderSummary(
+            work_order_id=wo["work_order_id"],
+            customer_name=wo["customer_name"],
+            paint_product_code=wo["paint_product_code"],
+            paint_product_name=wo["paint_product_name"],
+            part_description=wo["part_description"],
+            quantity=wo["quantity"],
+            serial_range=wo["serial_range"],
+            priority=wo.get("priority", False),
+            progress=done,
+            overall_status=overall,
+        ))
+    items.sort(key=lambda x: (not x.priority, x.work_order_id))
+    return items
+
+
+# ---- coating specs (used by the New Work Order form) ----
+@api.get("/coating-specifications", response_model=List[PaintSystemSpec])
+async def list_coating_specs(_=Depends(get_current_user)):
+    """paint_system_specifications rows imported from MVG040014N.xlsx.
+
+    `specification` codes are not unique (one code can have several
+    system/paint-brand rows) — rows are picked by uuid in the WO form.
+    """
+    assert pool is not None
+    rows = await pool.fetch("select * from paint_system_specifications order by specification, system_number, paint_brand")
+    return [PaintSystemSpec(**{**dict(r), "id": str(r["id"])}) for r in rows]
+
+
+async def _next_wo_id(conn) -> str:
     """Atomically generate the next WO-YYYY-NNNN id for the current year."""
     year = datetime.now(timezone.utc).year
-    res = await db.counters.find_one_and_update(
-        {"_id": f"wo_seq_{year}"},
-        {"$inc": {"seq": 1}},
-        upsert=True,
-        return_document=True,
+    seq = await conn.fetchval(
+        """insert into wo_counters (year, seq) values ($1, 1)
+           on conflict (year) do update set seq = wo_counters.seq + 1
+           returning seq""",
+        year,
     )
-    seq = res["seq"] if res else 1
-    # Seed accounts for the four pre-existing WO-2024-99xx ids; new ones start at 0001 for current year.
     return f"WO-{year}-{seq:04d}"
 
 
 @api.post("/work-orders", response_model=WorkOrderSummary, status_code=201)
 async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_current_user)):
-    # Resolve the coating spec: Supabase paint-system row (new path, picked by
-    # row id) or the legacy hardcoded catalog (kept for the seeded mock WOs).
-    if body.paint_system_id:
-        if supabase is None:
-            raise HTTPException(500, "Supabase not configured (SUPABASE_URL/SUPABASE_KEY missing)")
-        res = supabase.table("paint_system_specifications").select("*").eq("id", body.paint_system_id).execute()
-        ps_rows = cast(List[dict], res.data)
-        if not ps_rows:
-            raise HTTPException(400, f"Unknown paint system id '{body.paint_system_id}'")
-        ps_row = ps_rows[0]
-        spec_name = _paint_system_product_name(ps_row)
-        spec_limits = _spec_from_paint_system_row(ps_row)
-    elif body.coating_spec_code in COATING_SPEC_CATALOG:
-        catalog = COATING_SPEC_CATALOG[body.coating_spec_code]
-        spec_name = catalog["name"]
-        spec_limits = catalog["spec"]
-    else:
-        raise HTTPException(400, f"Unknown coating specification '{body.coating_spec_code}'")
-
-    # duplicate guard: same PO + line item + part + revision = likely the same job
-    if not body.confirm_duplicate:
-        dup = await db.work_orders.find_one(
-            {
-                "po_number": body.po_number,
-                "po_line_item_number": body.po_line_item_number,
-                "part_number": body.part_number,
-                "part_revision_number": body.part_revision_number,
-            },
-            {"_id": 0, "work_order_id": 1, "customer_name": 1, "paint_product_code": 1,
-             "quantity": 1, "created_at": 1, "created_by": 1, "stages": 1},
+    assert pool is not None
+    async with pool.acquire() as conn:
+        ps_row = await conn.fetchrow(
+            "select * from paint_system_specifications where id = $1::uuid", body.paint_system_id
         )
-        if dup:
-            done, overall = stage_progress(dup.get("stages", []))
-            await write_audit(
-                dup["work_order_id"], None, current, "work_order_duplicate_warned",
-                f"Inspector {current['employee_id']} attempted to create a duplicate WO for "
-                f"PO {body.po_number} line {body.po_line_item_number} part {body.part_number} rev {body.part_revision_number}",
+        if not ps_row:
+            raise HTTPException(400, f"Unknown paint system id '{body.paint_system_id}'")
+        ps = dict(ps_row)
+        spec_name = _paint_system_product_name(ps)
+        spec_limits = _spec_from_paint_system_row(ps)
+        coat_limits = _coat_limits_from_paint_system_row(ps)
+
+        # duplicate guard: same PO + line item + part + revision = likely the same job
+        if not body.confirm_duplicate:
+            dup = await conn.fetchrow(
+                """select * from work_orders
+                   where po_number = $1 and po_line_item_number = $2
+                     and part_number = $3 and part_revision_number = $4""",
+                body.po_number, body.po_line_item_number, body.part_number, body.part_revision_number,
             )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "duplicate": True,
-                    "message": "A work order already exists for this PO line + part + revision.",
-                    "existing": {
-                        "work_order_id": dup["work_order_id"],
-                        "customer_name": dup.get("customer_name"),
-                        "paint_product_code": dup.get("paint_product_code"),
-                        "quantity": dup.get("quantity"),
-                        "created_at": dup.get("created_at"),
-                        "created_by": dup.get("created_by"),
-                        "overall_status": overall,
-                        "progress": done,
+            if dup:
+                dup_stages = await conn.fetch(
+                    "select * from work_order_stages where work_order_id = $1 order by stage_order", dup["id"]
+                )
+                done, overall = stage_progress([_stage_dict(s) for s in dup_stages])
+                await write_audit(
+                    dup["work_order_id"], None, current, "work_order_duplicate_warned",
+                    f"Inspector {current['employee_id']} attempted to create a duplicate WO for "
+                    f"PO {body.po_number} line {body.po_line_item_number} part {body.part_number} rev {body.part_revision_number}",
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "duplicate": True,
+                        "message": "A work order already exists for this PO line + part + revision.",
+                        "existing": {
+                            "work_order_id": dup["work_order_id"],
+                            "customer_name": dup["customer_name"],
+                            "paint_product_code": dup["paint_product_code"],
+                            "quantity": dup["quantity"],
+                            "created_at": _iso(dup["created_at"]),
+                            "created_by": dup["created_by"],
+                            "overall_status": overall,
+                            "progress": done,
+                        },
                     },
-                },
+                )
+
+        part_description = f"{body.part_number} Rev {body.part_revision_number}"
+        serial_range = f"{body.part_number}-001 → {body.part_number}-{body.quantity:03d}"
+
+        async with conn.transaction():
+            work_order_id = await _next_wo_id(conn)
+            row_id = await conn.fetchval(
+                """insert into work_orders
+                     (work_order_id, po_number, po_line_item_number, customer_name, customer_address,
+                      part_number, part_revision_number, part_description,
+                      paint_product_code, paint_product_name, coating_spec_revision_number,
+                      quantity, serial_range, priority,
+                      surface_profile_min_um, surface_profile_max_um, dft_min_um, dft_max_um, soluble_salts_max_mg_m2,
+                      coat_limits, paint_system_id, created_by)
+                   values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::uuid,$22)
+                   returning id""",
+                work_order_id, body.po_number, body.po_line_item_number, body.customer_name,
+                body.customer_address or "", body.part_number, body.part_revision_number, part_description,
+                body.coating_spec_code, spec_name, body.coating_spec_revision_number,
+                body.quantity, serial_range, False,
+                spec_limits["surface_profile_min_um"], spec_limits["surface_profile_max_um"],
+                spec_limits["dft_min_um"], spec_limits["dft_max_um"], spec_limits["soluble_salts_max_mg_m2"],
+                coat_limits, body.paint_system_id, current["employee_id"],
             )
+            for order, s in enumerate(STAGES, start=1):
+                await conn.execute(
+                    """insert into work_order_stages
+                         (work_order_id, stage_key, stage_order, name, description, requires_coat_readings)
+                       values ($1,$2,$3,$4,$5,$6)""",
+                    row_id, s["key"], order, s["name"], s["description"], s["requires_coat_readings"],
+                )
 
-    work_order_id = await _next_wo_id()
-    # composite uniqueness on (part_number, part_revision_number) is captured by the
-    # part_description we build below — and indexed via the document fields too.
-    part_description = f"{body.part_number} Rev {body.part_revision_number}"
-
-    doc = {
-        "work_order_id": work_order_id,
-        # legacy/display fields (consumed by existing screens — left intact)
-        "po_number": body.po_number,
-        "customer_name": body.customer_name,
-        "paint_product_code": body.coating_spec_code,
-        "paint_product_name": spec_name,
-        "part_description": part_description,
-        "quantity": body.quantity,
-        "serial_range": f"{body.part_number}-001 → {body.part_number}-{body.quantity:03d}",
-        "priority": False,
-        "spec": spec_limits,
-        "paint_system_id": body.paint_system_id,
-        # new fields introduced by the Create-WO feature
-        "customer_address": body.customer_address or "",
-        "po_line_item_number": body.po_line_item_number,
-        "part_number": body.part_number,
-        "part_revision_number": body.part_revision_number,
-        "coating_spec_revision_number": body.coating_spec_revision_number,
-        # 6-stage workflow scaffold
-        "stages": [
-            {
-                "key": s["key"],
-                "name": s["name"],
-                "description": s["description"],
-                "requires_coat_readings": s["requires_coat_readings"],
-                "status": "pending",
-                "result": None,
-                "submission": None,
-                "submitted_at": None,
-                "submitted_by": None,
-            }
-            for s in STAGES
-        ],
-        "created_at": now_iso(),
-        "created_by": current["employee_id"],
-    }
-    await db.work_orders.insert_one(doc.copy())
     await write_audit(work_order_id, None, current, "work_order_created",
                       f"WO {work_order_id} created for {body.customer_name} / {body.po_number} line {body.po_line_item_number}")
 
     return WorkOrderSummary(
         work_order_id=work_order_id,
-        customer_name=doc["customer_name"],
-        paint_product_code=doc["paint_product_code"],
-        paint_product_name=doc["paint_product_name"],
-        part_description=doc["part_description"],
-        quantity=doc["quantity"],
-        serial_range=doc["serial_range"],
+        customer_name=body.customer_name,
+        paint_product_code=body.coating_spec_code,
+        paint_product_name=spec_name,
+        part_description=part_description,
+        quantity=body.quantity,
+        serial_range=serial_range,
         priority=False,
         progress=0,
         overall_status="pending",
@@ -667,9 +719,12 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
 
 @api.get("/work-orders/{work_order_id}", response_model=WorkOrderDetail)
 async def get_work_order(work_order_id: str, _=Depends(get_current_user)):
-    wo = await db.work_orders.find_one({"work_order_id": work_order_id}, {"_id": 0})
-    if not wo:
+    assert pool is not None
+    async with pool.acquire() as conn:
+        wos = await _fetch_work_orders(conn, work_order_id)
+    if not wos:
         raise HTTPException(404, "Work order not found")
+    wo = wos[0]
     done, overall = stage_progress(wo["stages"])
     return WorkOrderDetail(
         work_order_id=wo["work_order_id"],
@@ -680,12 +735,52 @@ async def get_work_order(work_order_id: str, _=Depends(get_current_user)):
         part_description=wo["part_description"],
         quantity=wo["quantity"],
         serial_range=wo["serial_range"],
-        priority=wo.get("priority", False),
+        priority=wo["priority"],
         progress=done,
         overall_status=overall,
         spec=PaintSpec(**wo["spec"]),
+        coat_limits=wo["coat_limits"],
         stages=wo["stages"],
     )
+
+
+@api.post("/work-orders/{work_order_id}/stages/{stage_key}/start")
+async def start_stage(
+    work_order_id: str,
+    stage_key: str,
+    body: StageStartRequest,
+    current=Depends(get_current_user),
+):
+    """Record start-of-stage readings as their own submission; the stage goes
+    in_progress and the final submit later only needs end readings + parameters."""
+    if stage_key not in STAGE_KEYS:
+        raise HTTPException(400, f"Unknown stage '{stage_key}'")
+    assert pool is not None
+    async with pool.acquire() as conn:
+        wo_row = await conn.fetchrow("select id from work_orders where work_order_id = $1", work_order_id)
+        if not wo_row:
+            raise HTTPException(404, "Work order not found")
+        stage = await conn.fetchrow(
+            "select * from work_order_stages where work_order_id = $1 and stage_key = $2",
+            wo_row["id"], stage_key,
+        )
+        if not stage:
+            raise HTTPException(404, "Stage not found on work order")
+        if stage["status"] in ("done", "fail"):
+            raise HTTPException(409, f"Stage '{stage_key}' already completed")
+        if stage["started_at"]:
+            raise HTTPException(409, f"Stage '{stage_key}' already started at {_iso(stage['started_at'])}")
+
+        started_at = datetime.now(timezone.utc)
+        await conn.execute(
+            """update work_order_stages
+               set status = 'in_progress', started_at = $3, started_by = $4, start_readings = $5
+               where work_order_id = $1 and stage_key = $2""",
+            wo_row["id"], stage_key, started_at, current["employee_id"], body.readings.model_dump(),
+        )
+    await write_audit(work_order_id, stage_key, current, "stage_started",
+                      f"Stage '{stage_key}' started by {current['employee_id']}")
+    return {"ok": True, "stage_key": stage_key, "work_order_id": work_order_id, "started_at": _iso(started_at)}
 
 
 @api.post("/work-orders/{work_order_id}/stages/{stage_key}/submit")
@@ -697,117 +792,137 @@ async def submit_stage(
 ):
     if stage_key not in STAGE_KEYS:
         raise HTTPException(400, f"Unknown stage '{stage_key}'")
-    wo = await db.work_orders.find_one({"work_order_id": work_order_id}, {"_id": 0})
-    if not wo:
-        raise HTTPException(404, "Work order not found")
+    assert pool is not None
+    async with pool.acquire() as conn:
+        wos = await _fetch_work_orders(conn, work_order_id)
+        if not wos:
+            raise HTTPException(404, "Work order not found")
+        wo = wos[0]
+        stage = next((s for s in wo["stages"] if s["key"] == stage_key), None)
+        if stage is None:
+            raise HTTPException(404, "Stage not found on work order")
 
-    spec = wo["spec"]
+        spec = wo["spec"]
+        p = body.parameters
+        vals = p.model_dump()
+        required = STAGE_PARAMS[stage_key]
 
-    # ---- server-side validation (defense-in-depth) ----
-    p = body.parameters
-    errors: List[str] = []
-    if not (spec["surface_profile_min_um"] <= p.surface_profile_um <= spec["surface_profile_max_um"]):
-        errors.append(
-            f"Surface profile {p.surface_profile_um} \u00b5m outside spec "
-            f"{spec['surface_profile_min_um']}-{spec['surface_profile_max_um']} \u00b5m"
+        missing = [k for k in required if vals.get(k) is None]
+        if missing:
+            raise HTTPException(400, f"Missing required parameters for stage '{stage_key}': {', '.join(missing)}")
+
+        # ---- server-side validation, stage-specific (defense-in-depth) ----
+        errors: List[str] = []
+        if "surface_profile_um" in required:
+            if not (spec["surface_profile_min_um"] <= vals["surface_profile_um"] <= spec["surface_profile_max_um"]):
+                errors.append(
+                    f"Surface profile {vals['surface_profile_um']} µm outside spec "
+                    f"{spec['surface_profile_min_um']}-{spec['surface_profile_max_um']} µm"
+                )
+        if "soluble_salts_mg_m2" in required:
+            salts_max = spec.get("soluble_salts_max_mg_m2")
+            if salts_max is not None and vals["soluble_salts_mg_m2"] > salts_max:
+                errors.append(f"Soluble salts {vals['soluble_salts_mg_m2']} mg/m² exceeds max {salts_max}")
+        if "dft_um" in required:
+            limits = _dft_limits_for_stage(wo, stage_key)
+            if limits:
+                lo, hi = limits
+                if vals["dft_um"] < lo:
+                    errors.append(f"DFT {vals['dft_um']} µm below min {lo} µm")
+                if vals["dft_um"] > hi:
+                    errors.append(f"DFT {vals['dft_um']} µm exceeds max {hi} µm (hard block)")
+
+        # gate check on END readings (final condition)
+        end = body.readings.end
+        gate_ok = True
+        if end.surface_temp_c is not None and end.dew_point_c is not None:
+            if not (end.surface_temp_c > end.dew_point_c + 3):
+                errors.append("Surface temp not > dew point + 3°C at end of stage")
+                gate_ok = False
+
+        # Hard-block on DFT-max regardless of submitted result
+        if any("hard block" in e for e in errors):
+            await write_audit(work_order_id, stage_key, current, "stage_submit_blocked",
+                              f"Hard-block: {'; '.join(errors)}")
+            raise HTTPException(status_code=422, detail={"hard_block": True, "errors": errors})
+
+        result = body.result if not errors else "fail"
+
+        # two-step flow: server-stored start readings win; body.start accepted
+        # for single-shot submissions on never-started stages.
+        start_readings = stage.get("start_readings") or (
+            body.readings.start.model_dump() if body.readings.start else None
         )
-    if p.dft_um < spec["dft_min_um"]:
-        errors.append(f"DFT {p.dft_um} \u00b5m below min {spec['dft_min_um']} \u00b5m")
-    if p.dft_um > spec["dft_max_um"]:
-        # hard block
-        errors.append(f"DFT {p.dft_um} \u00b5m exceeds max {spec['dft_max_um']} \u00b5m (hard block)")
-    salts_max = spec.get("soluble_salts_max_mg_m2")
-    if salts_max is not None and p.soluble_salts_mg_m2 > salts_max:
-        errors.append(f"Soluble salts {p.soluble_salts_mg_m2} mg/m\u00b2 exceeds max {salts_max}")
+        submitted_at = datetime.now(timezone.utc)
+        submission = {
+            "readings": {"start": start_readings, "end": end.model_dump()},
+            "parameters": vals,
+            "notes": body.notes or "",
+            "photos": body.photos[:5],
+            "result": result,
+            "errors": errors,
+            "gate_ok": gate_ok,
+            "submitted_by": current["employee_id"],
+            "submitted_at": _iso(submitted_at),
+        }
 
-    # gate check on END readings (final condition)
-    end = body.readings.end
-    gate_ok = True
-    if end.surface_temp_c is not None and end.dew_point_c is not None:
-        if not (end.surface_temp_c > end.dew_point_c + 3):
-            errors.append("Surface temp not > dew point + 3\u00b0C at end of stage")
-            gate_ok = False
+        async with conn.transaction():
+            await conn.execute(
+                """update work_order_stages
+                   set status = $3, result = $4, submission = $5, submitted_at = $6, submitted_by = $7
+                   where work_order_id = $1::uuid and stage_key = $2""",
+                wo["id"], stage_key,
+                "done" if result == "pass" else "fail", result, submission, submitted_at, current["employee_id"],
+            )
+            if result == "pass":
+                await conn.execute(
+                    """insert into quota (date, completed, target) values (current_date, 1, 25)
+                       on conflict (date) do update set completed = quota.completed + 1"""
+                )
 
-    # Hard-block on DFT-max regardless of submitted result
-    if any("hard block" in e for e in errors):
-        await write_audit(work_order_id, stage_key, current, "stage_submit_blocked",
-                          f"Hard-block: {'; '.join(errors)}")
-        raise HTTPException(status_code=422, detail={"hard_block": True, "errors": errors})
-
-    result = body.result if not errors else "fail"
-
-    submission = {
-        "readings": body.readings.model_dump(),
-        "parameters": body.parameters.model_dump(),
-        "notes": body.notes or "",
-        "photos": body.photos[:5],
-        "result": result,
-        "errors": errors,
-        "gate_ok": gate_ok,
-        "submitted_by": current["employee_id"],
-        "submitted_at": now_iso(),
-    }
-
-    # update the stage
-    new_stages = []
-    for s in wo["stages"]:
-        if s["key"] == stage_key:
-            s = {
-                **s,
-                "status": "done" if result == "pass" else "fail",
-                "result": result,
-                "submission": submission,
-                "submitted_at": submission["submitted_at"],
-                "submitted_by": current["employee_id"],
-            }
-        new_stages.append(s)
-
-    await db.work_orders.update_one(
-        {"work_order_id": work_order_id},
-        {"$set": {"stages": new_stages}},
-    )
-
-    await write_audit(
-        work_order_id, stage_key, current,
-        "stage_submit",
-        f"Stage '{stage_key}' submitted with result={result}. "
-        f"SP={p.surface_profile_um}\u00b5m DFT={p.dft_um}\u00b5m Salts={p.soluble_salts_mg_m2}mg/m\u00b2",
-    )
-
-    # increment quota on pass
-    if result == "pass":
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        await db.quota.update_one({"date": today}, {"$inc": {"completed": 1}}, upsert=True)
+    measured = ", ".join(f"{k}={vals[k]}" for k in required) if required else "observational"
+    await write_audit(work_order_id, stage_key, current, "stage_submit",
+                      f"Stage '{stage_key}' submitted with result={result}. {measured}")
 
     return {"ok": True, "result": result, "errors": errors, "stage_key": stage_key,
-            "work_order_id": work_order_id, "submitted_at": submission["submitted_at"]}
+            "work_order_id": work_order_id, "submitted_at": _iso(submitted_at)}
 
 
 @api.get("/work-orders/{work_order_id}/audit-log", response_model=List[AuditEntry])
 async def audit_log(work_order_id: str, _=Depends(get_current_user)):
-    cursor = db.audit_log.find({"work_order_id": work_order_id}, {"_id": 0}).sort("timestamp", -1)
-    return [AuditEntry(**e) async for e in cursor]
+    assert pool is not None
+    rows = await pool.fetch(
+        'select * from audit_log where work_order_id = $1 order by "timestamp" desc', work_order_id
+    )
+    return [
+        AuditEntry(
+            id=str(r["id"]), work_order_id=r["work_order_id"], stage_key=r["stage_key"],
+            actor_employee_id=r["actor_employee_id"], actor_name=r["actor_name"],
+            action=r["action"], detail=r["detail"] or "", timestamp=_iso(r["timestamp"]) or "",
+        )
+        for r in rows
+    ]
 
 
 # history
 @api.get("/inspections/history", response_model=List[HistoryItem])
 async def history(current=Depends(get_current_user)):
-    out: List[HistoryItem] = []
-    cursor = db.work_orders.find({}, {"_id": 0}).limit(200)
-    async for wo in cursor:
-        for s in wo["stages"]:
-            if s.get("submitted_at"):
-                out.append(HistoryItem(
-                    work_order_id=wo["work_order_id"],
-                    customer_name=wo["customer_name"],
-                    stage_key=s["key"],
-                    stage_name=s["name"],
-                    result=s.get("result") or "pending",
-                    timestamp=s["submitted_at"],
-                    inspector_name=s.get("submitted_by") or "",
-                ))
-    out.sort(key=lambda x: x.timestamp, reverse=True)
-    return out
+    assert pool is not None
+    rows = await pool.fetch(
+        """select w.work_order_id, w.customer_name, s.stage_key, s.name, s.result, s.submitted_at, s.submitted_by
+           from work_order_stages s join work_orders w on w.id = s.work_order_id
+           where s.submitted_at is not null
+           order by s.submitted_at desc limit 200"""
+    )
+    return [
+        HistoryItem(
+            work_order_id=r["work_order_id"], customer_name=r["customer_name"],
+            stage_key=r["stage_key"], stage_name=r["name"],
+            result=r["result"] or "pending", timestamp=_iso(r["submitted_at"]) or "",
+            inspector_name=r["submitted_by"] or "",
+        )
+        for r in rows
+    ]
 
 
 # weather (auto-pulled). Mocked but realistic. If OPENWEATHER_API_KEY is set later,
@@ -834,12 +949,14 @@ async def weather(_=Depends(get_current_user)):
 # dashboard
 @api.get("/dashboard")
 async def dashboard(current=Depends(get_current_user)):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    quota = await db.quota.find_one({"date": today}, {"_id": 0}) or {"completed": 0, "target": 25}
-    # current assignment = first priority not-done WO
+    assert pool is not None
+    async with pool.acquire() as conn:
+        quota_row = await conn.fetchrow("select completed, target from quota where date = current_date")
+        wos = await _fetch_work_orders(conn, limit=50)
+    quota = dict(quota_row) if quota_row else {"completed": 0, "target": 25}
+
     current_wo = None
-    cursor = db.work_orders.find({}, {"_id": 0}).sort("priority", -1).limit(50)
-    async for wo in cursor:
+    for wo in wos:
         done, overall = stage_progress(wo["stages"])
         if overall != "done":
             current_wo = {
@@ -847,7 +964,7 @@ async def dashboard(current=Depends(get_current_user)):
                 "customer_name": wo["customer_name"],
                 "part_description": wo["part_description"],
                 "paint_product_code": wo["paint_product_code"],
-                "priority": wo.get("priority", False),
+                "priority": wo["priority"],
                 "progress": done,
                 "overall_status": overall,
                 "stages": wo["stages"],
@@ -877,8 +994,3 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("coating-portal")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    client.close()

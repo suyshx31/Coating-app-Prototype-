@@ -191,10 +191,27 @@ class TestStageSubmit:
         assert r.json()["result"] == "fail"
 
     def test_salts_over_max_marks_fail(self, auth):
+        # salts are validated at surface_prep (per-stage params); ZINC-GALV-XL max is 15
         body = {
             "readings": _valid_readings(),
-            "parameters": {"surface_profile_um": 70, "dft_um": 320, "soluble_salts_mg_m2": 99},
+            "parameters": {"surface_profile_um": 70, "soluble_salts_mg_m2": 99},
             "notes": "TEST salts fail",
+            "photos": [],
+            "result": "pass",
+        }
+        r = requests.post(
+            f"{API}/work-orders/WO-2024-9912/stages/surface_prep/submit",
+            json=body, headers=auth, timeout=15,
+        )
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
+
+    def test_missing_required_param_rejected(self, auth):
+        # primer_coat requires dft_um; omitting it must 400, not silently pass
+        body = {
+            "readings": _valid_readings(),
+            "parameters": {"surface_profile_um": 70},
+            "notes": "TEST missing dft",
             "photos": [],
             "result": "pass",
         }
@@ -202,8 +219,69 @@ class TestStageSubmit:
             f"{API}/work-orders/WO-2024-9920/stages/primer_coat/submit",
             json=body, headers=auth, timeout=15,
         )
-        assert r.status_code == 200
-        assert r.json()["result"] == "fail"
+        assert r.status_code == 400
+
+    def test_two_step_start_then_submit(self, auth):
+        # tests run against a persistent DB and /start rejects completed stages,
+        # so create a dedicated WO from a real paint-system spec each run
+        specs = requests.get(f"{API}/coating-specifications", headers=auth, timeout=15).json()
+        assert len(specs) >= 1
+        spec = specs[0]
+        create_body = {
+            "customer_name": "Two-Step Test Co",
+            "po_number": f"PO-TEST-{int(time.time())}",
+            "po_line_item_number": 1,
+            "part_number": "PN-2STEP",
+            "part_revision_number": "A",
+            "coating_spec_code": spec["specification"],
+            "coating_spec_revision_number": spec["spec_rev"] or "0",
+            "paint_system_id": spec["id"],
+            "quantity": 1,
+        }
+        created = requests.post(f"{API}/work-orders", json=create_body, headers=auth, timeout=15)
+        assert created.status_code == 201, created.text
+        wo_id = created.json()["work_order_id"]
+
+        # start-of-stage readings recorded separately
+        start_body = {"readings": {"ambient_temp_c": 21.5, "relative_humidity_pct": 44.0,
+                                   "dew_point_c": 9.0, "surface_temp_c": 17.5}}
+        r = requests.post(f"{API}/work-orders/{wo_id}/stages/primer_coat/start",
+                          json=start_body, headers=auth, timeout=15)
+        assert r.status_code == 200, r.text
+        assert r.json()["started_at"]
+
+        # starting twice must conflict
+        r2 = requests.post(f"{API}/work-orders/{wo_id}/stages/primer_coat/start",
+                           json=start_body, headers=auth, timeout=15)
+        assert r2.status_code == 409
+
+        # stage now shows in_progress with stored start readings
+        detail = requests.get(f"{API}/work-orders/{wo_id}", headers=auth, timeout=15).json()
+        stg = next(s for s in detail["stages"] if s["key"] == "primer_coat")
+        assert stg["status"] == "in_progress"
+        assert stg["start_readings"]["surface_temp_c"] == 17.5
+
+        # end submission carries only end readings + the stage's parameter:
+        # a DFT inside this spec's primer window (per-coat limits from the paint system)
+        primer_lo, primer_hi = detail["coat_limits"]["primer"]
+        submit_body = {
+            "readings": {"end": {"ambient_temp_c": 22.0, "relative_humidity_pct": 45.0,
+                                 "dew_point_c": 9.5, "surface_temp_c": 18.0}},
+            "parameters": {"dft_um": (primer_lo + primer_hi) / 2},
+            "notes": "TEST two-step",
+            "photos": [],
+            "result": "pass",
+        }
+        r3 = requests.post(f"{API}/work-orders/{wo_id}/stages/primer_coat/submit",
+                           json=submit_body, headers=auth, timeout=15)
+        assert r3.status_code == 200, r3.text
+        assert r3.json()["result"] == "pass"
+
+        # stored submission merged the server-side start readings
+        detail = requests.get(f"{API}/work-orders/{wo_id}", headers=auth, timeout=15).json()
+        stg = next(s for s in detail["stages"] if s["key"] == "primer_coat")
+        assert stg["status"] == "done"
+        assert stg["submission"]["readings"]["start"]["surface_temp_c"] == 17.5
 
     def test_gate_fails_when_surface_not_gt_dew_plus_3(self, auth):
         readings = _valid_readings()
