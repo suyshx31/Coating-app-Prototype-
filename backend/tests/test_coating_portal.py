@@ -1,5 +1,6 @@
 """End-to-end backend tests for the Coating Portal API."""
 import os
+import re
 import time
 import pytest
 import requests
@@ -57,9 +58,9 @@ class TestWorkOrders:
         ids = {w["work_order_id"] for w in items}
         # 4 seed work orders
         assert {"WO-2024-9901", "WO-2024-9905", "WO-2024-9912", "WO-2024-9920"}.issubset(ids)
-        # WO format
+        # WO id format (any year — the DB persists WOs created by other tests/users)
         for w in items:
-            assert w["work_order_id"].startswith("WO-2024-")
+            assert re.match(r"^WO-\d{4}-\d{4}$", w["work_order_id"]), w["work_order_id"]
 
     def test_filter_priority(self, auth):
         r = requests.get(f"{API}/work-orders?filter=priority", headers=auth, timeout=15)
