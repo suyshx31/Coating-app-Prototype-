@@ -435,22 +435,6 @@ async def _fetch_work_orders(conn, work_order_id: Optional[str] = None, limit: i
 
 
 # ---------- seed ----------
-LEGACY_SPECS = {
-    "EPOXY-COAT-X": {"name": "Epoxy Coat X (Aerospace Grade)",
-                     "surface_profile_min_um": 50, "surface_profile_max_um": 100,
-                     "dft_min_um": 250, "dft_max_um": 400, "soluble_salts_max_mg_m2": 20},
-    "POLY-SHIELD-40": {"name": "Poly-Shield 40 Industrial Topcoat",
-                       "surface_profile_min_um": 40, "surface_profile_max_um": 90,
-                       "dft_min_um": 200, "dft_max_um": 350, "soluble_salts_max_mg_m2": 20},
-    "ZINC-GALV-XL": {"name": "Zinc-Galv XL Heavy Duty",
-                     "surface_profile_min_um": 60, "surface_profile_max_um": 120,
-                     "dft_min_um": 300, "dft_max_um": 500, "soluble_salts_max_mg_m2": 15},
-    "MARINE-GUARD": {"name": "Marine-Guard Anticorrosive",
-                     "surface_profile_min_um": 45, "surface_profile_max_um": 95,
-                     "dft_min_um": 275, "dft_max_um": 425, "soluble_salts_max_mg_m2": 18},
-}
-
-
 async def seed_data():
     assert pool is not None
     async with pool.acquire() as conn:
@@ -470,48 +454,9 @@ async def seed_data():
                     emp, name, email, pwd_ctx.hash("Inspector@123"), role, shift, dept, avatar,
                 )
 
-        if await conn.fetchval("select count(*) from work_orders") == 0:
-            seed_wos = [
-                ("WO-2024-9901", "PO-AC-44821", "Aerospace Precision Corp.", "EPOXY-COAT-X",
-                 "Aerospace Chassis - Component Batch A-92", 24, "AP-2024-0801 → AP-2024-0824", True),
-                ("WO-2024-9905", "PO-TD-10994", "Titan Dynamics Ltd.", "POLY-SHIELD-40",
-                 "Drilling Riser Joint - Lot R12", 12, "TD-R12-0301 → TD-R12-0312", False),
-                ("WO-2024-9912", "PO-GH-77123", "Global Hydraulics", "ZINC-GALV-XL",
-                 "Subsea Manifold Spool", 6, "GH-SMS-401 → GH-SMS-406", True),
-                ("WO-2024-9920", "PO-OM-55021", "Oceanic Marine Svcs", "MARINE-GUARD",
-                 "Wellhead Christmas Tree Assembly", 3, "OM-WCT-001 → OM-WCT-003", False),
-            ]
-            async with conn.transaction():
-                for wo_id, po, customer, code, part, qty, serials, priority in seed_wos:
-                    spec = LEGACY_SPECS[code]
-                    row_id = await conn.fetchval(
-                        """insert into work_orders
-                             (work_order_id, po_number, customer_name, paint_product_code, paint_product_name,
-                              part_description, quantity, serial_range, priority,
-                              surface_profile_min_um, surface_profile_max_um, dft_min_um, dft_max_um, soluble_salts_max_mg_m2)
-                           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-                           returning id""",
-                        wo_id, po, customer, code, spec["name"], part, qty, serials, priority,
-                        spec["surface_profile_min_um"], spec["surface_profile_max_um"],
-                        spec["dft_min_um"], spec["dft_max_um"], spec["soluble_salts_max_mg_m2"],
-                    )
-                    for order, s in enumerate(STAGES, start=1):
-                        # pre-mark progress on the priority order to match the dashboard mock
-                        pre_done = wo_id == "WO-2024-9901" and s["key"] in ("surface_prep", "primer_coat")
-                        await conn.execute(
-                            """insert into work_order_stages
-                                 (work_order_id, stage_key, stage_order, name, description, requires_coat_readings,
-                                  status, result, submitted_at, submitted_by)
-                               values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-                            row_id, s["key"], order, s["name"], s["description"], s["requires_coat_readings"],
-                            "done" if pre_done else "pending", "pass" if pre_done else None,
-                            datetime.now(timezone.utc) if pre_done else None, "QC-7742" if pre_done else None,
-                        )
-
-        await conn.execute(
-            """insert into quota (date, completed, target) values (current_date, 14, 25)
-               on conflict (date) do nothing"""
-        )
+        # Demo work orders and mock quota are intentionally NOT seeded — the
+        # database holds real work orders only. Inspector accounts above are
+        # kept so a fresh environment is still log-in-able.
 
 
 async def _init_conn(conn):
