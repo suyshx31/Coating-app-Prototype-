@@ -9,7 +9,9 @@ import time
 import pytest
 import requests
 
-BASE = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "http://localhost:8001").rstrip("/")
+# Port 8002 = the dedicated test stack provisioned by conftest.py (throwaway
+# Docker Postgres + its own uvicorn). Never point this at the live backend.
+BASE = os.environ.get("TEST_BACKEND_URL", "http://localhost:8002").rstrip("/")
 API = f"{BASE}/api"
 
 EMAIL = "j.thompson@aerospace-precision.com"
