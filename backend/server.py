@@ -23,7 +23,7 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -126,18 +126,14 @@ class StageReadingPair(BaseModel):
     start: Optional[StageReadings] = None
     end: StageReadings = Field(default_factory=StageReadings)
 
-class MeasuredParameters(BaseModel):
-    # All optional — which ones are required depends on the stage row's params.
-    surface_profile_um: Optional[float] = None
-    dft_um: Optional[float] = None
-    soluble_salts_mg_m2: Optional[float] = None
-
 class StageStartRequest(BaseModel):
     readings: StageReadings = Field(default_factory=StageReadings)
 
 class StageSubmission(BaseModel):
     readings: StageReadingPair
-    parameters: MeasuredParameters = Field(default_factory=MeasuredParameters)
+    # values keyed by the stage's field definitions (work_order_stages.fields,
+    # snapshotted from the case-type template); validated server-side per type
+    fields: dict = Field(default_factory=dict)
     notes: Optional[str] = ""
     photos: List[str] = Field(default_factory=list)  # base64 strings
     result: Literal["pass", "fail"] = "pass"
@@ -347,6 +343,109 @@ def _dft_limits_for_stage(wo: dict, stage: dict):
     return None
 
 
+def _gate_errors(r: StageReadings, when: str) -> List[str]:
+    """Surface-temperature gate, with a distinct reason per failure mode:
+    - > 60°C: too hot to coat (fails regardless of dew point)
+    - not > dew point + 3°C: condensation risk
+    """
+    errs: List[str] = []
+    if r.surface_temp_c is not None and r.surface_temp_c > 60:
+        errs.append(f"Too hot for coat — Fail (surface {r.surface_temp_c}°C > 60°C at {when} of stage)")
+    if r.surface_temp_c is not None and r.dew_point_c is not None and not (r.surface_temp_c > r.dew_point_c + 3):
+        errs.append(
+            f"Surface temp {r.surface_temp_c}°C too close to dew point {r.dew_point_c}°C "
+            f"(needs > dew point + 3°C) at {when} of stage"
+        )
+    return errs
+
+
+OK_NOTOK = {"OK", "NOT_OK"}
+PASS_FAIL = {"PASS", "FAIL"}
+
+
+def _field_range(wo: dict, stage: dict, fdef: dict, values: dict):
+    """Resolve a field's validation window from its `range` name; None = no check."""
+    rng = fdef.get("range")
+    if rng == "pct":
+        return 0.0, 100.0
+    if rng == "anchor_profile":
+        # spec stores the anchor window in µm; these fields are captured in mils
+        spec = wo.get("spec") or {}
+        if spec.get("surface_profile_min_um") is None:
+            return None
+        return (round(spec["surface_profile_min_um"] / MILS_TO_UM, 2),
+                round(spec["surface_profile_max_um"] / MILS_TO_UM, 2))
+    if rng == "dft_window":
+        return _dft_limits_for_stage(wo, stage)
+    if rng == "wft":
+        # WFT window derived from the stage's DFT window and the submitted
+        # volume % solids: WFT = DFT / (solids/100). Skipped if solids absent.
+        dft = _dft_limits_for_stage(wo, stage)
+        try:
+            solids = float(values.get("volume_pct_solids"))
+        except (TypeError, ValueError):
+            return None
+        if not dft or solids <= 0:
+            return None
+        return round(dft[0] * 100 / solids, 1), round(dft[1] * 100 / solids, 1)
+    return None
+
+
+def _validate_stage_fields(wo: dict, stage: dict, values: dict):
+    """Validate submitted values against the stage's field definitions.
+
+    Returns (missing_keys, errors, hard_block). fail_on values and
+    out-of-range numbers produce errors (stage result -> fail); DFT fields
+    marked hard_block_max escalate over-max to a submission hard block.
+    """
+    missing: List[str] = []
+    errors: List[str] = []
+    hard_block = False
+    for f in stage.get("fields") or []:
+        key, ftype = f["key"], f["type"]
+        label = f.get("label", key)
+        val = values.get(key)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            if f.get("required"):
+                missing.append(key)
+            continue
+        if ftype in ("number", "decimal"):
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                errors.append(f"{label}: '{val}' is not a number")
+                continue
+            window = _field_range(wo, stage, f, values)
+            if window:
+                lo, hi = window
+                unit = f.get("unit", "")
+                if num < lo:
+                    errors.append(f"{label} {num} {unit} below min {lo} {unit}".strip())
+                if num > hi:
+                    if f.get("hard_block_max"):
+                        errors.append(f"{label} {num} {unit} exceeds max {hi} {unit} (hard block)".strip())
+                        hard_block = True
+                    else:
+                        errors.append(f"{label} {num} {unit} exceeds max {hi} {unit}".strip())
+        elif ftype == "ok_notok":
+            if val not in OK_NOTOK:
+                errors.append(f"{label}: must be OK or NOT_OK")
+            elif val == f.get("fail_on"):
+                errors.append(f"{label}: NOT OK")
+        elif ftype == "pass_fail":
+            if val not in PASS_FAIL:
+                errors.append(f"{label}: must be PASS or FAIL")
+            elif val == f.get("fail_on"):
+                errors.append(f"{label}: FAIL")
+        elif ftype == "date":
+            try:
+                date.fromisoformat(str(val))
+            except ValueError:
+                errors.append(f"{label}: invalid date, expected YYYY-MM-DD")
+        # text / note / dropdown: presence is the only server-side requirement
+    return missing, errors, hard_block
+
+
 def _paint_system_product_name(row: dict) -> str:
     coats = [row.get("primer_paint_product"), row.get("intermediate_coat_product"), row.get("top_coat_product")]
     chain = " → ".join(c for c in coats if c)
@@ -371,6 +470,7 @@ def _stage_dict(row) -> dict:
         "start_readings": row["start_readings"],
         "params": row["params"],
         "dft_window": row["dft_window"],
+        "fields": row["fields"],
     }
 
 
@@ -553,8 +653,57 @@ async def list_case_types(_=Depends(get_current_user)):
             "requires_coat_readings": r["requires_coat_readings"],
             "params": r["params"],
             "dft_window": r["dft_window"],
+            "fields": r["fields"],
         })
     return [{"case_type": ct, "stages": stages} for ct, stages in grouped.items()]
+
+
+# ---- paint options (feeds stage-form dropdowns) ----
+@api.get("/paint-options")
+async def paint_options(_=Depends(get_current_user)):
+    """Dropdown options derived from existing data — approved_paint_suppliers
+    (brands) and paint_system_specifications' denormalized columns (products
+    per brand/coat, colors, shades). The normalized Brand/Product/Shade lookup
+    tables are on hold; this endpoint is read-only derivation, not new schema.
+    Product strings are deduped case-insensitively (source sheet mixes cases).
+    `ral` is a stub — structure present, deliberately unpopulated.
+    """
+    assert pool is not None
+    brands = [r["supplier_name"] for r in
+              await pool.fetch("select supplier_name from approved_paint_suppliers order by 1")]
+    rows = await pool.fetch(
+        """select paint_brand, primer_paint_product, intermediate_coat_product, top_coat_product,
+                  primer_coat_color, intermediate_coat_color, top_coat_paint_shade
+           from paint_system_specifications"""
+    )
+    products: dict = {b: {"primer": [], "intermediate": [], "top": []} for b in brands}
+    colors: set = set()
+    shades: dict = {}
+
+    def add_product(brand, coat, name):
+        if not brand or not name or brand not in products:
+            return
+        bucket = products[brand][coat]
+        if name.upper() not in {p.upper() for p in bucket}:
+            bucket.append(name)
+
+    for r in rows:
+        add_product(r["paint_brand"], "primer", r["primer_paint_product"])
+        add_product(r["paint_brand"], "intermediate", r["intermediate_coat_product"])
+        add_product(r["paint_brand"], "top", r["top_coat_product"])
+        for c in (r["primer_coat_color"], r["intermediate_coat_color"]):
+            if c:
+                colors.add(c)
+        if r["top_coat_paint_shade"] and r["paint_brand"] and r["top_coat_product"]:
+            shades.setdefault(f"{r['paint_brand']}::{r['top_coat_product']}", []).append(r["top_coat_paint_shade"])
+
+    return {
+        "brands": brands,
+        "products": products,          # products[brand][primer|intermediate|top]
+        "colors": sorted(colors),      # brand-agnostic
+        "shades": shades,              # keyed "BRAND::PRODUCT" (empty until data exists)
+        "ral": [],                     # stub: standard RAL chart, not populated yet
+    }
 
 
 # ---- coating specs (used by the New Work Order form) ----
@@ -667,10 +816,10 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
                 await conn.execute(
                     """insert into work_order_stages
                          (work_order_id, stage_key, stage_order, name, description,
-                          requires_coat_readings, params, dft_window)
-                       values ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                          requires_coat_readings, params, dft_window, fields)
+                       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
                     row_id, t["stage_key"], t["stage_order"], t["name"], t["description"],
-                    t["requires_coat_readings"], t["params"], t["dft_window"],
+                    t["requires_coat_readings"], t["params"], t["dft_window"], t["fields"],
                 )
 
     await write_audit(work_order_id, None, current, "work_order_created",
@@ -749,6 +898,14 @@ async def start_stage(
         if stage["started_at"]:
             raise HTTPException(409, f"Stage '{stage_key}' already started at {_iso(stage['started_at'])}")
 
+        # surface-temperature gate at start of stage (coat stages only):
+        # too-hot (>60°C) and dew-point proximity block the start, each with
+        # its specific reason
+        if stage["requires_coat_readings"]:
+            gate = _gate_errors(body.readings, "start")
+            if gate:
+                raise HTTPException(status_code=422, detail={"gate_failed": True, "errors": gate})
+
         started_at = datetime.now(timezone.utc)
         await conn.execute(
             """update work_order_stages
@@ -778,47 +935,20 @@ async def submit_stage(
         if stage is None:
             raise HTTPException(404, f"Stage '{stage_key}' does not exist on this work order")
 
-        spec = wo["spec"]
-        p = body.parameters
-        vals = p.model_dump()
-        # field set was snapshotted onto the stage row from the case-type template
-        required = stage.get("params") or []
-
-        missing = [k for k in required if vals.get(k) is None]
+        # ---- server-side validation from the stage's field definitions ----
+        values = body.fields or {}
+        missing, errors, hard_block = _validate_stage_fields(wo, stage, values)
         if missing:
-            raise HTTPException(400, f"Missing required parameters for stage '{stage_key}': {', '.join(missing)}")
+            raise HTTPException(400, f"Missing required fields for stage '{stage_key}': {', '.join(missing)}")
 
-        # ---- server-side validation, stage-specific (defense-in-depth) ----
-        errors: List[str] = []
-        if "surface_profile_um" in required:
-            if not (spec["surface_profile_min_um"] <= vals["surface_profile_um"] <= spec["surface_profile_max_um"]):
-                errors.append(
-                    f"Surface profile {vals['surface_profile_um']} µm outside spec "
-                    f"{spec['surface_profile_min_um']}-{spec['surface_profile_max_um']} µm"
-                )
-        if "soluble_salts_mg_m2" in required:
-            salts_max = spec.get("soluble_salts_max_mg_m2")
-            if salts_max is not None and vals["soluble_salts_mg_m2"] > salts_max:
-                errors.append(f"Soluble salts {vals['soluble_salts_mg_m2']} mg/m² exceeds max {salts_max}")
-        if "dft_um" in required:
-            limits = _dft_limits_for_stage(wo, stage)
-            if limits:
-                lo, hi = limits
-                if vals["dft_um"] < lo:
-                    errors.append(f"DFT {vals['dft_um']} µm below min {lo} µm")
-                if vals["dft_um"] > hi:
-                    errors.append(f"DFT {vals['dft_um']} µm exceeds max {hi} µm (hard block)")
-
-        # gate check on END readings (final condition)
+        # surface-temperature gate on END readings, distinct reason per mode
         end = body.readings.end
-        gate_ok = True
-        if end.surface_temp_c is not None and end.dew_point_c is not None:
-            if not (end.surface_temp_c > end.dew_point_c + 3):
-                errors.append("Surface temp not > dew point + 3°C at end of stage")
-                gate_ok = False
+        gate_errs = _gate_errors(end, "end")
+        gate_ok = not gate_errs
+        errors.extend(gate_errs)
 
         # Hard-block on DFT-max regardless of submitted result
-        if any("hard block" in e for e in errors):
+        if hard_block:
             await write_audit(work_order_id, stage_key, current, "stage_submit_blocked",
                               f"Hard-block: {'; '.join(errors)}")
             raise HTTPException(status_code=422, detail={"hard_block": True, "errors": errors})
@@ -833,7 +963,7 @@ async def submit_stage(
         submitted_at = datetime.now(timezone.utc)
         submission = {
             "readings": {"start": start_readings, "end": end.model_dump()},
-            "parameters": vals,
+            "fields": values,
             "notes": body.notes or "",
             "photos": body.photos[:5],
             "result": result,
@@ -857,7 +987,7 @@ async def submit_stage(
                        on conflict (date) do update set completed = quota.completed + 1"""
                 )
 
-    measured = ", ".join(f"{k}={vals[k]}" for k in required) if required else "observational"
+    measured = ", ".join(f"{k}={v}" for k, v in values.items()) if values else "observational"
     await write_audit(work_order_id, stage_key, current, "stage_submit",
                       f"Stage '{stage_key}' submitted with result={result}. {measured}")
 
