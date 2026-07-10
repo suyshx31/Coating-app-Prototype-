@@ -72,6 +72,7 @@ export const api = {
   weather: () => request<Weather>(`/weather`),
   dashboard: () => request<Dashboard>(`/dashboard`),
   coatingSpecs: () => request<CoatingSpec[]>(`/coating-specifications`),
+  caseTypes: () => request<CaseTypeInfo[]>(`/case-types`),
   createWorkOrder: (body: CreateWorkOrderBody) =>
     request<WorkOrderSummary>(`/work-orders`, { method: "POST", body: JSON.stringify(body) }),
 };
@@ -104,6 +105,7 @@ export type CoatingSpec = {
 };
 
 export type CreateWorkOrderBody = {
+  case_type: string;
   customer_name: string;
   customer_address?: string;
   po_number: string;
@@ -130,6 +132,7 @@ export type DuplicateExistingWO = {
 
 export type WorkOrderSummary = {
   work_order_id: string;
+  case_type: string;
   customer_name: string;
   paint_product_code: string;
   paint_product_name: string;
@@ -158,6 +161,8 @@ export type StageReadings = {
   surface_temp_c: number | null;
 };
 
+export type DftWindow = "primer" | "mid_cumulative" | "top" | "total";
+
 export type Stage = {
   key: string;
   name: string;
@@ -171,14 +176,25 @@ export type Stage = {
   started_at: string | null;
   started_by: string | null;
   start_readings: StageReadings | null;
+  // snapshot from the case-type template: which measured params this stage takes
+  params: string[];
+  dft_window: DftWindow | null;
 };
 
-// Cumulative DFT windows (µm) per coat stage, from the paint-system spec.
+// DFT windows (µm) per coat stage, from the paint-system spec.
+// "top" = standalone top-coat window (top_coat_only), "total" = full system.
 export type CoatLimits = {
   primer: [number, number] | null;
   intermediate: [number, number] | null;
+  top: [number, number] | null;
   mid_cumulative: [number, number] | null;
   total: [number, number] | null;
+};
+
+export type CaseTypeInfo = {
+  case_type: string;
+  stages: { key: string; order: number; name: string; description: string;
+            requires_coat_readings: boolean; params: string[]; dft_window: DftWindow | null }[];
 };
 
 export type WorkOrderDetail = WorkOrderSummary & {

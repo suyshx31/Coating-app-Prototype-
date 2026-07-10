@@ -15,7 +15,7 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
-import { api, WorkOrderDetail, Weather } from "@/src/api";
+import { api, Stage, WorkOrderDetail, Weather } from "@/src/api";
 import { colors, radius, spacing, type } from "@/src/theme";
 import { Card, DataId, Label, StatusPill } from "@/src/components/UI";
 
@@ -33,21 +33,13 @@ const emptyR: Readings = {
   surface_temp_c: "",
 };
 
-// Mirror of backend STAGE_PARAMS: which measured parameters each stage takes.
-// curing / final_qc are observational (readings, photos, notes, result only).
-const STAGE_FIELDS: Record<string, ("surface_profile" | "dft" | "salts")[]> = {
-  surface_prep: ["surface_profile", "salts"],
-  primer_coat: ["dft"],
-  mid_inspection: ["dft"],
-  top_coat: ["dft"],
-  curing: [],
-  final_qc: [],
-};
-
-const DFT_LABEL: Record<string, string> = {
-  primer_coat: "PRIMER COAT DFT (µm)",
-  mid_inspection: "CUMULATIVE DFT (µm)",
-  top_coat: "TOTAL SYSTEM DFT (µm)",
+// Input label per DFT validation window (window comes from the stage row,
+// snapshotted off the case-type template at WO creation).
+const DFT_WINDOW_LABELS: Record<string, string> = {
+  primer: "PRIMER COAT DFT (µm)",
+  mid_cumulative: "CUMULATIVE DFT (µm)",
+  top: "TOP COAT DFT (µm)",
+  total: "TOTAL SYSTEM DFT (µm)",
 };
 
 function n(s: string): number | null {
@@ -56,15 +48,10 @@ function n(s: string): number | null {
   return Number.isFinite(v) ? v : null;
 }
 
-// Cumulative DFT window for this stage: per-coat limits from the paint system
-// when present, else the WO's total spec range (legacy WOs).
-function dftWindow(wo: WorkOrderDetail, stageKey: string): [number, number] {
-  const cl = wo.coat_limits;
-  const w =
-    stageKey === "primer_coat" ? cl?.primer
-    : stageKey === "mid_inspection" ? cl?.mid_cumulative
-    : stageKey === "top_coat" ? cl?.total
-    : null;
+// DFT window for this stage per its dft_window snapshot; falls back to the
+// WO's total spec range if the paint system lacks that window.
+function dftWindow(wo: WorkOrderDetail, stage: Stage): [number, number] {
+  const w = stage.dft_window ? wo.coat_limits?.[stage.dft_window] : null;
   return w ?? [wo.spec.dft_min_um, wo.spec.dft_max_um];
 }
 
@@ -85,7 +72,6 @@ export default function StageFormScreen() {
   const [photos, setPhotos] = useState<string[]>([]);
 
   const stageKey = String(stage);
-  const fields = useMemo(() => STAGE_FIELDS[stageKey] ?? [], [stageKey]);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -104,6 +90,16 @@ export default function StageFormScreen() {
   }, [load]);
 
   const stageMeta = wo?.stages.find((s) => s.key === stageKey);
+  // Which measured parameters this stage takes — from the stage row snapshot
+  // (set per case type at WO creation), not a hardcoded per-key map.
+  const fields = useMemo(() => {
+    const p = stageMeta?.params ?? [];
+    const out: ("surface_profile" | "dft" | "salts")[] = [];
+    if (p.includes("surface_profile_um")) out.push("surface_profile");
+    if (p.includes("dft_um")) out.push("dft");
+    if (p.includes("soluble_salts_mg_m2")) out.push("salts");
+    return out;
+  }, [stageMeta]);
   // Two-step flow: record start readings first, end readings + parameters after.
   const phase: "start" | "end" | "submitted" =
     stageMeta?.status === "done" || stageMeta?.status === "fail" ? "submitted"
@@ -133,7 +129,7 @@ export default function StageFormScreen() {
     return { ok: false, msg: `${st} ≤ ${dp} + 3 °C — unsafe to coat` };
   }, [readings]);
 
-  const [dftMin, dftMax] = wo ? dftWindow(wo, stageKey) : [0, 0];
+  const [dftMin, dftMax] = wo && stageMeta ? dftWindow(wo, stageMeta) : [0, 0];
 
   const dftIssue = useMemo(() => {
     if (!wo || !fields.includes("dft")) return null;
@@ -379,7 +375,7 @@ export default function StageFormScreen() {
                 {fields.includes("dft") ? (
                   <View style={{ marginTop: spacing.md }}>
                     <View style={styles.rowBetween}>
-                      <Text style={[type.label, { color: colors.textPrimary }]}>{DFT_LABEL[stageKey] ?? "DFT (µm)"}</Text>
+                      <Text style={[type.label, { color: colors.textPrimary }]}>{(stageMeta?.dft_window && DFT_WINDOW_LABELS[stageMeta.dft_window]) || "DFT (µm)"}</Text>
                       <Text style={type.caption}>Min {dftMin} · Max {dftMax}</Text>
                     </View>
                     <TextInput

@@ -16,7 +16,7 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
-import { api, CoatingSpec, CreateWorkOrderBody, DuplicateExistingWO } from "@/src/api";
+import { api, CaseTypeInfo, CoatingSpec, CreateWorkOrderBody, DuplicateExistingWO } from "@/src/api";
 import { colors, radius, spacing, type } from "@/src/theme";
 import { Card, Label } from "@/src/components/UI";
 
@@ -30,6 +30,7 @@ type Form = {
   coating_spec_code: string;
   coating_spec_revision_number: string;
   paint_system_id: string;
+  case_type: string;
   quantity: string;
 };
 
@@ -43,7 +44,16 @@ const initial: Form = {
   coating_spec_code: "",
   coating_spec_revision_number: "",
   paint_system_id: "",
+  case_type: "",
   quantity: "",
+};
+
+// Friendly display names for the 4 case types (keys come from /case-types)
+const CASE_TYPE_LABELS: Record<string, string> = {
+  only_primer: "Only Primer",
+  primer_intermediate: "Primer + Intermediate",
+  primer_intermediate_top: "Primer + Intermediate + Top Coat",
+  top_coat_only: "Top Coat Only",
 };
 
 export default function NewWorkOrderScreen() {
@@ -51,6 +61,7 @@ export default function NewWorkOrderScreen() {
   const insets = useSafeAreaInsets();
   const [form, setForm] = useState<Form>(initial);
   const [specs, setSpecs] = useState<CoatingSpec[]>([]);
+  const [caseTypes, setCaseTypes] = useState<CaseTypeInfo[]>([]);
   const [specsLoading, setSpecsLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [showSpecPicker, setShowSpecPicker] = useState(false);
@@ -62,8 +73,9 @@ export default function NewWorkOrderScreen() {
   useEffect(() => {
     (async () => {
       try {
-        const r = await api.coatingSpecs();
+        const [r, ct] = await Promise.all([api.coatingSpecs(), api.caseTypes()]);
         setSpecs(r);
+        setCaseTypes(ct);
       } catch (e: any) {
         if (e?.status === 401) router.replace("/login");
       } finally {
@@ -84,6 +96,7 @@ export default function NewWorkOrderScreen() {
     if (!form.part_number.trim()) e.part_number = "Required";
     if (!form.part_revision_number.trim()) e.part_revision_number = "Required";
     if (!form.paint_system_id) e.coating_spec_code = "Pick a spec";
+    if (!form.case_type) e.case_type = "Pick a case type";
     if (!form.coating_spec_revision_number.trim()) e.coating_spec_revision_number = "Required";
     if (!form.quantity.trim()) e.quantity = "Required";
     else if (!/^\d+$/.test(form.quantity) || Number(form.quantity) < 1) e.quantity = "Whole number ≥ 1";
@@ -102,6 +115,7 @@ export default function NewWorkOrderScreen() {
     coating_spec_code: form.coating_spec_code,
     coating_spec_revision_number: form.coating_spec_revision_number.trim(),
     paint_system_id: form.paint_system_id,
+    case_type: form.case_type,
     quantity: Number(form.quantity),
   });
 
@@ -219,6 +233,38 @@ export default function NewWorkOrderScreen() {
             <Text style={[type.caption, { marginTop: spacing.xs }]}>
               Part Number + Revision form the unique part identifier.
             </Text>
+          </Card>
+
+          <Card style={{ marginTop: spacing.md }}>
+            <Label>Case Type</Label>
+            <Text style={[type.caption, { marginTop: spacing.xs }]}>
+              Determines which stages this work order goes through.
+            </Text>
+            {caseTypes.map((ct) => {
+              const selected = form.case_type === ct.case_type;
+              return (
+                <TouchableOpacity
+                  key={ct.case_type}
+                  testID={`case-type-${ct.case_type}`}
+                  onPress={() => { set("case_type", ct.case_type); blur("case_type"); }}
+                  style={[styles.specOption, { marginTop: spacing.sm }, selected && { backgroundColor: colors.bg, borderColor: colors.brand }]}
+                  activeOpacity={0.85}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={[type.body, { fontWeight: "700" }]}>
+                      {CASE_TYPE_LABELS[ct.case_type] ?? ct.case_type}
+                    </Text>
+                    <Text style={[type.caption, { marginTop: 2 }]}>
+                      {ct.stages.map((s) => s.name).join(" → ")}
+                    </Text>
+                  </View>
+                  {selected ? <Ionicons name="checkmark-circle" size={20} color={colors.successText} /> : null}
+                </TouchableOpacity>
+              );
+            })}
+            {touched.case_type && errors.case_type ? (
+              <Text style={styles.inlineErr}>{errors.case_type}</Text>
+            ) : null}
           </Card>
 
           <Card style={{ marginTop: spacing.md }}>
