@@ -1,13 +1,17 @@
 """Coating Portal backend — FastAPI + PostgreSQL (Supabase).
 
 Implements the domain model from the spec:
-- work_orders / work_order_stages (6-stage workflow, WO-YYYY-NNNN ids)
+- work_orders / work_order_stages (case-type-driven workflow, WO-YYYY-NNNN ids):
+  each work order picks one of 4 case types (only_primer, primer_intermediate,
+  primer_intermediate_top, top_coat_only) whose stage sequence + per-stage
+  field sets come from case_type_stage_templates and are snapshotted onto
+  work_order_stages at creation
 - inspectors (JWT email/password auth), audit_log, quota, wo_counters
 - paint_system_specifications (imported from MVG040014N.xlsx) drives the
   coating-spec picker and per-coat DFT validation windows
 - WeatherReading (API-sourced, mocked) + manual surface temperature captured
   as separate start-of-stage and end-of-stage submissions
-- MeasuredParameter validation is stage-specific (STAGE_PARAMS): surface
+- MeasuredParameter validation is stage-specific (stage row's params): surface
   profile + soluble salts at surface prep, cumulative DFT at coat stages,
   observational only at curing / final QC. DFT over max hard-blocks.
 
@@ -46,29 +50,11 @@ bearer = HTTPBearer(auto_error=False)
 
 pool: Optional[asyncpg.Pool] = None
 
-# ---------- stages ----------
-STAGES = [
-    {"key": "surface_prep",     "name": "Surface Prep",     "description": "Degreasing and mechanical abrasion",     "requires_coat_readings": True},
-    {"key": "primer_coat",      "name": "Primer Coat",      "description": "Epoxy base application",                 "requires_coat_readings": True},
-    {"key": "mid_inspection",   "name": "Mid-Inspection",   "description": "Thickness uniformity check",             "requires_coat_readings": False},
-    {"key": "top_coat",         "name": "Top Coat",         "description": "Finish layer application",               "requires_coat_readings": True},
-    {"key": "curing",           "name": "Curing Process",   "description": "Oven cycle: 200°C for 45 mins",     "requires_coat_readings": False},
-    {"key": "final_qc",         "name": "Final QC",         "description": "Visual and adherence testing",           "requires_coat_readings": False},
-]
-STAGE_KEYS = [s["key"] for s in STAGES]
-
-# Which measured parameters each stage requires. DFT readings are cumulative
-# film build: primer stage checks the primer window, mid-inspection the
-# primer(+intermediate) window, top coat the total-system window.
-# curing / final_qc are observational (notes, photos, result only).
-STAGE_PARAMS: dict = {
-    "surface_prep":   ["surface_profile_um", "soluble_salts_mg_m2"],
-    "primer_coat":    ["dft_um"],
-    "mid_inspection": ["dft_um"],
-    "top_coat":       ["dft_um"],
-    "curing":         [],
-    "final_qc":       [],
-}
+# ---------- case types ----------
+# Stage sequences and per-stage field sets live in case_type_stage_templates;
+# each work order snapshots its case's template rows into work_order_stages at
+# creation. This Literal mirrors the DB CHECK constraint on work_orders.case_type.
+CaseType = Literal["only_primer", "primer_intermediate", "primer_intermediate_top", "top_coat_only"]
 
 MILS_TO_UM = 25.4
 
@@ -104,6 +90,7 @@ class PaintSpec(BaseModel):
 
 class WorkOrderSummary(BaseModel):
     work_order_id: str
+    case_type: str
     customer_name: str
     paint_product_code: str
     paint_product_name: str
@@ -111,8 +98,8 @@ class WorkOrderSummary(BaseModel):
     quantity: int
     serial_range: str
     priority: bool
-    progress: int  # number of stages done
-    total_stages: int = 6
+    progress: int       # number of stages done
+    total_stages: int   # stage count depends on case_type
     overall_status: str  # pending | in_progress | done | fail
 
 class WorkOrderDetail(WorkOrderSummary):
@@ -140,7 +127,7 @@ class StageReadingPair(BaseModel):
     end: StageReadings = Field(default_factory=StageReadings)
 
 class MeasuredParameters(BaseModel):
-    # All optional — which ones are required depends on the stage (STAGE_PARAMS).
+    # All optional — which ones are required depends on the stage row's params.
     surface_profile_um: Optional[float] = None
     dft_um: Optional[float] = None
     soluble_salts_mg_m2: Optional[float] = None
@@ -156,6 +143,7 @@ class StageSubmission(BaseModel):
     result: Literal["pass", "fail"] = "pass"
 
 class CreateWorkOrderRequest(BaseModel):
+    case_type: CaseType
     customer_name: str = Field(..., min_length=1)
     customer_address: Optional[str] = ""  # only optional field
     po_number: str = Field(..., min_length=1)            # external customer PO ref
@@ -332,6 +320,7 @@ def _coat_limits_from_paint_system_row(row: dict) -> dict:
 
     primer = rng("primer_coat_dft_low_mils", "primer_coat_dft_high_mils")
     intermediate = rng("intermediate_coat_dft_low_mils", "intermediate_coat_dft_high_mils")
+    top = rng("top_coat_dft_low_mils", "top_coat_dft_high_mils")
     total = rng("bottom_total_dft_system", "top_total_dft_system")
     mid = None
     if primer:
@@ -339,17 +328,17 @@ def _coat_limits_from_paint_system_row(row: dict) -> dict:
             round(primer[0] + (intermediate[0] if intermediate else 0), 1),
             round(primer[1] + (intermediate[1] if intermediate else 0), 1),
         ]
-    return {"primer": primer, "intermediate": intermediate, "mid_cumulative": mid, "total": total}
+    # "top" is the standalone top-coat window (used by top_coat_only, where
+    # there is no primer underneath); "total" is the full-system cumulative.
+    return {"primer": primer, "intermediate": intermediate, "top": top,
+            "mid_cumulative": mid, "total": total}
 
 
-def _dft_limits_for_stage(wo: dict, stage_key: str):
-    """Cumulative DFT window (µm) to validate at a given stage; None = no check."""
+def _dft_limits_for_stage(wo: dict, stage: dict):
+    """DFT window (µm) for a stage, per its snapshot dft_window; None = no check."""
     coat = wo.get("coat_limits") or {}
-    window = {
-        "primer_coat": coat.get("primer"),
-        "mid_inspection": coat.get("mid_cumulative"),
-        "top_coat": coat.get("total"),
-    }.get(stage_key)
+    window_key = stage.get("dft_window")
+    window = coat.get(window_key) if window_key else None
     if window:
         return window[0], window[1]
     spec = wo.get("spec") or {}
@@ -380,6 +369,8 @@ def _stage_dict(row) -> dict:
         "started_at": _iso(row["started_at"]),
         "started_by": row["started_by"],
         "start_readings": row["start_readings"],
+        "params": row["params"],
+        "dft_window": row["dft_window"],
     }
 
 
@@ -387,6 +378,7 @@ def _wo_dict(row, stages: List[dict]) -> dict:
     return {
         "id": str(row["id"]),
         "work_order_id": row["work_order_id"],
+        "case_type": row["case_type"],
         "po_number": row["po_number"],
         "po_line_item_number": row["po_line_item_number"],
         "customer_name": row["customer_name"],
@@ -525,6 +517,7 @@ async def list_work_orders(
                 continue
         items.append(WorkOrderSummary(
             work_order_id=wo["work_order_id"],
+            case_type=wo["case_type"],
             customer_name=wo["customer_name"],
             paint_product_code=wo["paint_product_code"],
             paint_product_name=wo["paint_product_name"],
@@ -533,10 +526,35 @@ async def list_work_orders(
             serial_range=wo["serial_range"],
             priority=wo.get("priority", False),
             progress=done,
+            total_stages=len(wo["stages"]),
             overall_status=overall,
         ))
     items.sort(key=lambda x: (not x.priority, x.work_order_id))
     return items
+
+
+# ---- case types (used by the New Work Order form picker) ----
+@api.get("/case-types")
+async def list_case_types(_=Depends(get_current_user)):
+    """The four case types with their stage sequences, from the template table."""
+    assert pool is not None
+    rows = await pool.fetch(
+        """select case_type, stage_key, stage_order, name, description,
+                  requires_coat_readings, params, dft_window
+           from case_type_stage_templates order by case_type, stage_order"""
+    )
+    grouped: dict = {}
+    for r in rows:
+        grouped.setdefault(r["case_type"], []).append({
+            "key": r["stage_key"],
+            "order": r["stage_order"],
+            "name": r["name"],
+            "description": r["description"],
+            "requires_coat_readings": r["requires_coat_readings"],
+            "params": r["params"],
+            "dft_window": r["dft_window"],
+        })
+    return [{"case_type": ct, "stages": stages} for ct, stages in grouped.items()]
 
 
 # ---- coating specs (used by the New Work Order form) ----
@@ -617,19 +635,27 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
         part_description = f"{body.part_number} Rev {body.part_revision_number}"
         serial_range = f"{body.part_number}-001 → {body.part_number}-{body.quantity:03d}"
 
+        # stage scaffold comes from the case type's template rows
+        templates = await conn.fetch(
+            "select * from case_type_stage_templates where case_type = $1 order by stage_order",
+            body.case_type,
+        )
+        if not templates:
+            raise HTTPException(500, f"No stage templates defined for case type '{body.case_type}'")
+
         async with conn.transaction():
             work_order_id = await _next_wo_id(conn)
             row_id = await conn.fetchval(
                 """insert into work_orders
-                     (work_order_id, po_number, po_line_item_number, customer_name, customer_address,
+                     (work_order_id, case_type, po_number, po_line_item_number, customer_name, customer_address,
                       part_number, part_revision_number, part_description,
                       paint_product_code, paint_product_name, coating_spec_revision_number,
                       quantity, serial_range, priority,
                       surface_profile_min_um, surface_profile_max_um, dft_min_um, dft_max_um, soluble_salts_max_mg_m2,
                       coat_limits, paint_system_id, created_by)
-                   values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::uuid,$22)
+                   values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::uuid,$23)
                    returning id""",
-                work_order_id, body.po_number, body.po_line_item_number, body.customer_name,
+                work_order_id, body.case_type, body.po_number, body.po_line_item_number, body.customer_name,
                 body.customer_address or "", body.part_number, body.part_revision_number, part_description,
                 body.coating_spec_code, spec_name, body.coating_spec_revision_number,
                 body.quantity, serial_range, False,
@@ -637,12 +663,14 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
                 spec_limits["dft_min_um"], spec_limits["dft_max_um"], spec_limits["soluble_salts_max_mg_m2"],
                 coat_limits, body.paint_system_id, current["employee_id"],
             )
-            for order, s in enumerate(STAGES, start=1):
+            for t in templates:
                 await conn.execute(
                     """insert into work_order_stages
-                         (work_order_id, stage_key, stage_order, name, description, requires_coat_readings)
-                       values ($1,$2,$3,$4,$5,$6)""",
-                    row_id, s["key"], order, s["name"], s["description"], s["requires_coat_readings"],
+                         (work_order_id, stage_key, stage_order, name, description,
+                          requires_coat_readings, params, dft_window)
+                       values ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                    row_id, t["stage_key"], t["stage_order"], t["name"], t["description"],
+                    t["requires_coat_readings"], t["params"], t["dft_window"],
                 )
 
     await write_audit(work_order_id, None, current, "work_order_created",
@@ -650,6 +678,7 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
 
     return WorkOrderSummary(
         work_order_id=work_order_id,
+        case_type=body.case_type,
         customer_name=body.customer_name,
         paint_product_code=body.coating_spec_code,
         paint_product_name=spec_name,
@@ -658,6 +687,7 @@ async def create_work_order(body: CreateWorkOrderRequest, current=Depends(get_cu
         serial_range=serial_range,
         priority=False,
         progress=0,
+        total_stages=len(templates),
         overall_status="pending",
     )
 
@@ -673,6 +703,7 @@ async def get_work_order(work_order_id: str, _=Depends(get_current_user)):
     done, overall = stage_progress(wo["stages"])
     return WorkOrderDetail(
         work_order_id=wo["work_order_id"],
+        case_type=wo["case_type"],
         po_number=wo["po_number"],
         customer_name=wo["customer_name"],
         paint_product_code=wo["paint_product_code"],
@@ -682,6 +713,7 @@ async def get_work_order(work_order_id: str, _=Depends(get_current_user)):
         serial_range=wo["serial_range"],
         priority=wo["priority"],
         progress=done,
+        total_stages=len(wo["stages"]),
         overall_status=overall,
         spec=PaintSpec(**wo["spec"]),
         coat_limits=wo["coat_limits"],
@@ -697,9 +729,10 @@ async def start_stage(
     current=Depends(get_current_user),
 ):
     """Record start-of-stage readings as their own submission; the stage goes
-    in_progress and the final submit later only needs end readings + parameters."""
-    if stage_key not in STAGE_KEYS:
-        raise HTTPException(400, f"Unknown stage '{stage_key}'")
+    in_progress and the final submit later only needs end readings + parameters.
+
+    Which stages exist depends on the work order's case type, so validity is
+    checked against this WO's own stage rows, not a global list."""
     assert pool is not None
     async with pool.acquire() as conn:
         wo_row = await conn.fetchrow("select id from work_orders where work_order_id = $1", work_order_id)
@@ -710,7 +743,7 @@ async def start_stage(
             wo_row["id"], stage_key,
         )
         if not stage:
-            raise HTTPException(404, "Stage not found on work order")
+            raise HTTPException(404, f"Stage '{stage_key}' does not exist on this work order")
         if stage["status"] in ("done", "fail"):
             raise HTTPException(409, f"Stage '{stage_key}' already completed")
         if stage["started_at"]:
@@ -735,8 +768,6 @@ async def submit_stage(
     body: StageSubmission,
     current=Depends(get_current_user),
 ):
-    if stage_key not in STAGE_KEYS:
-        raise HTTPException(400, f"Unknown stage '{stage_key}'")
     assert pool is not None
     async with pool.acquire() as conn:
         wos = await _fetch_work_orders(conn, work_order_id)
@@ -745,12 +776,13 @@ async def submit_stage(
         wo = wos[0]
         stage = next((s for s in wo["stages"] if s["key"] == stage_key), None)
         if stage is None:
-            raise HTTPException(404, "Stage not found on work order")
+            raise HTTPException(404, f"Stage '{stage_key}' does not exist on this work order")
 
         spec = wo["spec"]
         p = body.parameters
         vals = p.model_dump()
-        required = STAGE_PARAMS[stage_key]
+        # field set was snapshotted onto the stage row from the case-type template
+        required = stage.get("params") or []
 
         missing = [k for k in required if vals.get(k) is None]
         if missing:
@@ -769,7 +801,7 @@ async def submit_stage(
             if salts_max is not None and vals["soluble_salts_mg_m2"] > salts_max:
                 errors.append(f"Soluble salts {vals['soluble_salts_mg_m2']} mg/m² exceeds max {salts_max}")
         if "dft_um" in required:
-            limits = _dft_limits_for_stage(wo, stage_key)
+            limits = _dft_limits_for_stage(wo, stage)
             if limits:
                 lo, hi = limits
                 if vals["dft_um"] < lo:
