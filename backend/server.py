@@ -640,7 +640,7 @@ async def list_case_types(_=Depends(get_current_user)):
     assert pool is not None
     rows = await pool.fetch(
         """select case_type, stage_key, stage_order, name, description,
-                  requires_coat_readings, params, dft_window
+                  requires_coat_readings, params, dft_window, fields
            from case_type_stage_templates order by case_type, stage_order"""
     )
     grouped: dict = {}

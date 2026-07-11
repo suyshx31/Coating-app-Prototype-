@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Modal,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -15,7 +17,7 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
-import { api, Stage, WorkOrderDetail, Weather } from "@/src/api";
+import { api, FieldDef, PaintOptions, Stage, WorkOrderDetail, Weather } from "@/src/api";
 import { colors, radius, spacing, type } from "@/src/theme";
 import { Card, DataId, Label, StatusPill } from "@/src/components/UI";
 
@@ -33,15 +35,6 @@ const emptyR: Readings = {
   surface_temp_c: "",
 };
 
-// Input label per DFT validation window (window comes from the stage row,
-// snapshotted off the case-type template at WO creation).
-const DFT_WINDOW_LABELS: Record<string, string> = {
-  primer: "PRIMER COAT DFT (µm)",
-  mid_cumulative: "CUMULATIVE DFT (µm)",
-  top: "TOP COAT DFT (µm)",
-  total: "TOTAL SYSTEM DFT (µm)",
-};
-
 function n(s: string): number | null {
   if (s === "" || s == null) return null;
   const v = Number(s);
@@ -55,6 +48,49 @@ function dftWindow(wo: WorkOrderDetail, stage: Stage): [number, number] {
   return w ?? [wo.spec.dft_min_um, wo.spec.dft_max_um];
 }
 
+// Client-side mirror of the server's range resolution (captions + hard-block hint).
+function fieldRange(
+  wo: WorkOrderDetail, stage: Stage, def: FieldDef, values: Record<string, string>,
+): [number, number] | null {
+  switch (def.range) {
+    case "pct":
+      return [0, 100];
+    case "anchor_profile":
+      return [
+        Math.round((wo.spec.surface_profile_min_um / 25.4) * 100) / 100,
+        Math.round((wo.spec.surface_profile_max_um / 25.4) * 100) / 100,
+      ];
+    case "dft_window":
+      return dftWindow(wo, stage);
+    case "wft": {
+      const solids = n(values["volume_pct_solids"] ?? "");
+      if (!solids || solids <= 0) return null;
+      const [lo, hi] = dftWindow(wo, stage);
+      return [Math.round((lo * 100) / solids * 10) / 10, Math.round((hi * 100) / solids * 10) / 10];
+    }
+    default:
+      return null;
+  }
+}
+
+function resolveOptions(def: FieldDef, opts: PaintOptions | null, values: Record<string, string>): string[] {
+  if (!opts) return [];
+  if (def.options === "brands") return opts.brands;
+  if (def.options === "colors") return opts.colors;
+  if (def.options === "ral") return opts.ral;
+  if (def.options?.startsWith("products.")) {
+    const coat = def.options.split(".")[1] as "primer" | "intermediate" | "top";
+    const brand = def.depends_on ? values[def.depends_on] : "";
+    return brand ? opts.products[brand]?.[coat] ?? [] : [];
+  }
+  if (def.options === "shades") {
+    const brand = values["brand"];
+    const product = values["product"];
+    return brand && product ? opts.shades[`${brand}::${product}`] ?? [] : [];
+  }
+  return [];
+}
+
 export default function StageFormScreen() {
   const { id, stage } = useLocalSearchParams<{ id: string; stage: string }>();
   const router = useRouter();
@@ -65,11 +101,11 @@ export default function StageFormScreen() {
   const [serverError, setServerError] = useState<string | null>(null);
 
   const [readings, setReadings] = useState<Readings>(emptyR);
-  const [surfaceProfile, setSurfaceProfile] = useState("");
-  const [dft, setDft] = useState("");
-  const [salts, setSalts] = useState("");
+  const [values, setValues] = useState<Record<string, string>>({});
   const [notes, setNotes] = useState("");
   const [photos, setPhotos] = useState<string[]>([]);
+  const [paintOpts, setPaintOpts] = useState<PaintOptions | null>(null);
+  const [pickerFor, setPickerFor] = useState<FieldDef | null>(null);
 
   const stageKey = String(stage);
 
@@ -90,17 +126,15 @@ export default function StageFormScreen() {
   }, [load]);
 
   const stageMeta = wo?.stages.find((s) => s.key === stageKey);
-  // Which measured parameters this stage takes — from the stage row snapshot
-  // (set per case type at WO creation), not a hardcoded per-key map.
-  const fields = useMemo(() => {
-    const p = stageMeta?.params ?? [];
-    const out: ("surface_profile" | "dft" | "salts")[] = [];
-    if (p.includes("surface_profile_um")) out.push("surface_profile");
-    if (p.includes("dft_um")) out.push("dft");
-    if (p.includes("soluble_salts_mg_m2")) out.push("salts");
-    return out;
-  }, [stageMeta]);
-  // Two-step flow: record start readings first, end readings + parameters after.
+  const fieldDefs = useMemo(() => stageMeta?.fields ?? [], [stageMeta]);
+  const hasDropdowns = fieldDefs.some((f) => f.type === "dropdown");
+
+  useEffect(() => {
+    if (!hasDropdowns || paintOpts) return;
+    api.paintOptions().then(setPaintOpts).catch(() => {});
+  }, [hasDropdowns, paintOpts]);
+
+  // Two-step flow: record start readings first, end readings + fields after.
   const phase: "start" | "end" | "submitted" =
     stageMeta?.status === "done" || stageMeta?.status === "fail" ? "submitted"
     : stageMeta?.started_at ? "end"
@@ -120,53 +154,41 @@ export default function StageFormScreen() {
     }
   }, []);
 
-  // Gate check: surface temp must be > dew point + 3
+  // Gate: >60°C = too hot (fails regardless); otherwise surface must exceed dew+3°C.
   const gate = useMemo(() => {
     const st = n(readings.surface_temp_c);
     const dp = n(readings.dew_point_c);
     if (st == null || dp == null) return { ok: false, msg: "Enter surface temp & dew point" };
+    if (st > 60) return { ok: false, msg: `Too hot for coat — Fail (${st}°C > 60°C)` };
     if (st > dp + 3) return { ok: true, msg: `${st} > ${dp} + 3 °C` };
-    return { ok: false, msg: `${st} ≤ ${dp} + 3 °C — unsafe to coat` };
+    return { ok: false, msg: `${st} ≤ ${dp} + 3 °C — too close to dew point` };
   }, [readings]);
 
-  const [dftMin, dftMax] = wo && stageMeta ? dftWindow(wo, stageMeta) : [0, 0];
+  const setValue = (key: string, v: string) => setValues((s) => ({ ...s, [key]: v }));
 
-  const dftIssue = useMemo(() => {
-    if (!wo || !fields.includes("dft")) return null;
-    const v = n(dft);
-    if (v == null) return null;
-    if (v > dftMax) return { hardBlock: true, msg: `DFT ${v} µm exceeds max ${dftMax} µm` };
-    if (v < dftMin) return { hardBlock: false, msg: `Below min ${dftMin} µm` };
-    return null;
-  }, [dft, wo, fields, dftMin, dftMax]);
+  // Per-field issue (range check mirror); hard_block_max escalates over-max.
+  const fieldIssue = useCallback(
+    (def: FieldDef): { msg: string; hardBlock: boolean } | null => {
+      if (!wo || !stageMeta) return null;
+      if (def.type !== "number" && def.type !== "decimal") return null;
+      const v = n(values[def.key] ?? "");
+      if (v == null) return null;
+      const range = fieldRange(wo, stageMeta, def, values);
+      if (!range) return null;
+      const [lo, hi] = range;
+      if (v > hi) return { msg: `Exceeds max ${hi}${def.unit ? ` ${def.unit}` : ""}`, hardBlock: !!def.hard_block_max };
+      if (v < lo) return { msg: `Below min ${lo}${def.unit ? ` ${def.unit}` : ""}`, hardBlock: false };
+      return null;
+    },
+    [wo, stageMeta, values],
+  );
 
-  const profileIssue = useMemo(() => {
-    if (!wo || !fields.includes("surface_profile")) return null;
-    const v = n(surfaceProfile);
-    if (v == null) return null;
-    if (v < wo.spec.surface_profile_min_um || v > wo.spec.surface_profile_max_um) {
-      return `Outside spec ${wo.spec.surface_profile_min_um}-${wo.spec.surface_profile_max_um} µm`;
-    }
-    return null;
-  }, [surfaceProfile, wo, fields]);
-
-  const saltsIssue = useMemo(() => {
-    if (!wo || !fields.includes("salts")) return null;
-    const v = n(salts);
-    if (v == null) return null;
-    if (wo.spec.soluble_salts_max_mg_m2 == null) return null; // spec defines no salts limit
-    if (v > wo.spec.soluble_salts_max_mg_m2) return `Exceeds max ${wo.spec.soluble_salts_max_mg_m2} mg/m²`;
-    return null;
-  }, [salts, wo, fields]);
-
+  const anyHardBlock = fieldDefs.some((d) => fieldIssue(d)?.hardBlock);
   const readingsFilled = !!(readings.surface_temp_c && readings.dew_point_c);
-  const paramsFilled =
-    (!fields.includes("surface_profile") || !!surfaceProfile) &&
-    (!fields.includes("dft") || !!dft) &&
-    (!fields.includes("salts") || !!salts);
+  const requiredFilled = fieldDefs.every((d) => !d.required || !!(values[d.key] ?? "").trim());
 
-  const canStart = readingsFilled && !submitting;
-  const canSubmit = readingsFilled && paramsFilled && !dftIssue?.hardBlock && !submitting;
+  const canStart = readingsFilled && gate.ok && !submitting;
+  const canSubmit = readingsFilled && requiredFilled && !anyHardBlock && !submitting;
 
   const addPhoto = () => {
     if (photos.length >= 5) return;
@@ -193,7 +215,7 @@ export default function StageFormScreen() {
       setReadings(emptyR); // form now collects END readings
       await load();
     } catch (e: any) {
-      setServerError(e?.message || "Failed to record start of stage");
+      setServerError(e?.body?.detail?.errors?.join("\n") || e?.message || "Failed to record start of stage");
     } finally {
       setSubmitting(false);
     }
@@ -204,21 +226,26 @@ export default function StageFormScreen() {
     setServerError(null);
     setSubmitting(true);
     try {
-      const parameters: Record<string, number> = {};
-      if (fields.includes("surface_profile")) parameters.surface_profile_um = Number(surfaceProfile);
-      if (fields.includes("dft")) parameters.dft_um = Number(dft);
-      if (fields.includes("salts")) parameters.soluble_salts_mg_m2 = Number(salts);
+      const fields: Record<string, string | number> = {};
+      for (const def of fieldDefs) {
+        const raw = (values[def.key] ?? "").trim();
+        if (!raw) continue;
+        fields[def.key] = def.type === "number" || def.type === "decimal" ? Number(raw) : raw;
+      }
+      const failByField = fieldDefs.some(
+        (d) => d.fail_on && values[d.key] === d.fail_on,
+      ) || fieldDefs.some((d) => fieldIssue(d) !== null);
       const body = {
         readings: { end: numericReadings() },
-        parameters,
+        fields,
         notes,
         photos,
-        result: gate.ok && !profileIssue && !saltsIssue && !dftIssue ? "pass" : "fail",
+        result: gate.ok && !failByField ? "pass" : "fail",
       };
       const r = await api.submitStage(wo.work_order_id, stageKey, body);
       router.replace(`/work-order/${wo.work_order_id}/submitted?stage=${stageKey}&result=${r.result}`);
     } catch (e: any) {
-      setServerError(e?.body?.detail?.errors?.join("\n") || e?.message || "Submission failed");
+      setServerError(e?.body?.detail?.errors?.join("\n") || e?.body?.detail || e?.message || "Submission failed");
     } finally {
       setSubmitting(false);
     }
@@ -231,6 +258,108 @@ export default function StageFormScreen() {
       </SafeAreaView>
     );
   }
+
+  const renderField = (def: FieldDef) => {
+    const issue = fieldIssue(def);
+    const val = values[def.key] ?? "";
+    const range = stageMeta ? fieldRange(wo, stageMeta, def, values) : null;
+    const caption =
+      def.type === "number" || def.type === "decimal"
+        ? range
+          ? `${range[0]}–${range[1]}${def.unit ? ` ${def.unit}` : ""}`
+          : def.unit ?? ""
+        : "";
+
+    return (
+      <View key={def.key} style={{ marginTop: spacing.md }}>
+        <View style={styles.rowBetween}>
+          <Text style={[type.label, { color: colors.textPrimary, flexShrink: 1 }]}>
+            {def.label.toUpperCase()}{def.required ? " *" : ""}
+          </Text>
+          {caption ? <Text style={type.caption}>{caption}</Text> : null}
+        </View>
+
+        {def.type === "ok_notok" || def.type === "pass_fail" ? (
+          <View style={styles.toggleRow}>
+            {(def.type === "ok_notok" ? ["OK", "NOT_OK"] : ["PASS", "FAIL"]).map((opt) => {
+              const selected = val === opt;
+              const failing = opt === def.fail_on;
+              return (
+                <TouchableOpacity
+                  key={opt}
+                  testID={`field-${def.key}-${opt}`}
+                  onPress={() => setValue(def.key, opt)}
+                  style={[
+                    styles.toggleBtn,
+                    selected && { backgroundColor: failing ? colors.errorBg : colors.successBg,
+                                  borderColor: failing ? colors.errorText : colors.successText },
+                  ]}
+                >
+                  <Text style={[type.label, { color: selected ? (failing ? colors.errorText : colors.successText) : colors.textSecondary }]}>
+                    {opt.replace("_", " ")}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        ) : def.type === "dropdown" ? (
+          (() => {
+            const opts = resolveOptions(def, paintOpts, values);
+            const blockedBy = def.depends_on && !values[def.depends_on];
+            return (
+              <>
+                <TouchableOpacity
+                  testID={`field-${def.key}-picker`}
+                  onPress={() => !blockedBy && setPickerFor(def)}
+                  style={[styles.input, styles.pickerRow, blockedBy && { opacity: 0.5 }]}
+                  activeOpacity={0.85}
+                >
+                  <Text style={val ? type.body : [type.body, { color: colors.textMuted }]}>
+                    {val || (blockedBy ? `Pick ${def.depends_on} first` : opts.length ? "Tap to select" : "No options available")}
+                  </Text>
+                  <Ionicons name="chevron-down" size={16} color={colors.textMuted} />
+                </TouchableOpacity>
+              </>
+            );
+          })()
+        ) : def.type === "note" ? (
+          <TextInput
+            testID={`field-${def.key}-input`}
+            value={val}
+            onChangeText={(v) => setValue(def.key, v)}
+            multiline
+            numberOfLines={3}
+            placeholder="Notes..."
+            placeholderTextColor={colors.textMuted}
+            style={[styles.input, { minHeight: 72, textAlignVertical: "top" }]}
+          />
+        ) : (
+          <TextInput
+            testID={`field-${def.key}-input`}
+            value={val}
+            onChangeText={(v) => setValue(def.key, v)}
+            keyboardType={def.type === "number" || def.type === "decimal" ? "decimal-pad" : "default"}
+            placeholder={def.type === "date" ? "YYYY-MM-DD" : def.type === "number" || def.type === "decimal" ? "0.00" : ""}
+            placeholderTextColor={colors.textMuted}
+            style={[styles.input, issue && styles.inputError]}
+          />
+        )}
+
+        {issue ? (
+          <View style={styles.hardBlock}>
+            <Ionicons
+              name={issue.hardBlock ? "lock-closed" : "warning-outline"}
+              size={14}
+              color={issue.hardBlock ? colors.errorText : colors.warningText}
+            />
+            <Text style={[styles.inlineErr, { color: issue.hardBlock ? colors.errorText : colors.warningText }]}>
+              {issue.hardBlock ? "HARD BLOCK · " : ""}{issue.msg}
+            </Text>
+          </View>
+        ) : null}
+      </View>
+    );
+  };
 
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
@@ -302,19 +431,19 @@ export default function StageFormScreen() {
                 </TouchableOpacity>
               </View>
               <View style={styles.grid2}>
-                <Field
+                <ReadingField
                   label="Air Temp (°C)"
                   testID="env-air-temp-input"
                   value={readings.ambient_temp_c}
                   onChangeText={(v) => setReadings((r) => ({ ...r, ambient_temp_c: v }))}
                 />
-                <Field
+                <ReadingField
                   label="Humidity (%)"
                   testID="env-rh-input"
                   value={readings.relative_humidity_pct}
                   onChangeText={(v) => setReadings((r) => ({ ...r, relative_humidity_pct: v }))}
                 />
-                <Field
+                <ReadingField
                   label="Dew Point (°C)"
                   testID="env-dew-input"
                   value={readings.dew_point_c}
@@ -327,7 +456,7 @@ export default function StageFormScreen() {
             {/* Surface Temp block (manual) */}
             <Card style={{ marginTop: spacing.md }}>
               <Label>Surface Temperature (Manual · Elcometer 319)</Label>
-              <Field
+              <ReadingField
                 label={`Surface Temp at ${phase.toUpperCase()} (°C)`}
                 testID={`env-surface-temp-${phase}-input`}
                 value={readings.surface_temp_c}
@@ -338,7 +467,7 @@ export default function StageFormScreen() {
                 <Ionicons name={gate.ok ? "checkmark-circle" : "alert-circle"} size={16} color={gate.ok ? colors.successText : colors.errorText} />
                 <View style={{ flex: 1 }}>
                   <Text style={[type.label, { color: gate.ok ? colors.successText : colors.errorText }]}>
-                    GATE · Surface Temp &gt; Dew Point + 3°C
+                    GATE · &le;60°C AND Surface Temp &gt; Dew Point + 3°C
                   </Text>
                   <Text style={[type.bodySm, { color: gate.ok ? colors.successText : colors.errorText, marginTop: 2 }]}>
                     {gate.msg}
@@ -348,87 +477,11 @@ export default function StageFormScreen() {
               </View>
             </Card>
 
-            {/* Measured parameters — END phase only, fields specific to this stage */}
-            {phase === "end" && fields.length > 0 ? (
+            {/* Stage fields — END phase only, from the stage's field definitions */}
+            {phase === "end" && fieldDefs.length > 0 ? (
               <Card style={{ marginTop: spacing.md }}>
-                <Label>Measured Parameters · {stageMeta?.name}</Label>
-
-                {fields.includes("surface_profile") ? (
-                  <View style={{ marginTop: spacing.md }}>
-                    <View style={styles.rowBetween}>
-                      <Text style={[type.label, { color: colors.textPrimary }]}>SURFACE PROFILE (µm)</Text>
-                      <Text style={type.caption}>Limit {wo.spec.surface_profile_min_um}-{wo.spec.surface_profile_max_um} µm</Text>
-                    </View>
-                    <TextInput
-                      testID="param-surface-profile-input"
-                      value={surfaceProfile}
-                      onChangeText={setSurfaceProfile}
-                      placeholder="0.00"
-                      placeholderTextColor={colors.textMuted}
-                      keyboardType="decimal-pad"
-                      style={[styles.input, profileIssue && styles.inputError]}
-                    />
-                    {profileIssue ? <Text style={styles.inlineErr}>{profileIssue}</Text> : null}
-                  </View>
-                ) : null}
-
-                {fields.includes("dft") ? (
-                  <View style={{ marginTop: spacing.md }}>
-                    <View style={styles.rowBetween}>
-                      <Text style={[type.label, { color: colors.textPrimary }]}>{(stageMeta?.dft_window && DFT_WINDOW_LABELS[stageMeta.dft_window]) || "DFT (µm)"}</Text>
-                      <Text style={type.caption}>Min {dftMin} · Max {dftMax}</Text>
-                    </View>
-                    <TextInput
-                      testID="param-dft-input"
-                      value={dft}
-                      onChangeText={setDft}
-                      placeholder="0.00"
-                      placeholderTextColor={colors.textMuted}
-                      keyboardType="decimal-pad"
-                      style={[styles.input, dftIssue && styles.inputError]}
-                    />
-                    {dftIssue ? (
-                      <View style={styles.hardBlock}>
-                        <Ionicons
-                          name={dftIssue.hardBlock ? "lock-closed" : "warning-outline"}
-                          size={14}
-                          color={dftIssue.hardBlock ? colors.errorText : colors.warningText}
-                        />
-                        <Text style={[styles.inlineErr, { color: dftIssue.hardBlock ? colors.errorText : colors.warningText }]}>
-                          {dftIssue.hardBlock ? "HARD BLOCK · " : ""}{dftIssue.msg}
-                        </Text>
-                      </View>
-                    ) : null}
-                  </View>
-                ) : null}
-
-                {fields.includes("salts") ? (
-                  <View style={{ marginTop: spacing.md }}>
-                    <View style={styles.rowBetween}>
-                      <Text style={[type.label, { color: colors.textPrimary }]}>SOLUBLE SALTS (mg/m²)</Text>
-                      <Text style={type.caption}>{wo.spec.soluble_salts_max_mg_m2 != null ? `Max ${wo.spec.soluble_salts_max_mg_m2}` : "No limit in spec"}</Text>
-                    </View>
-                    <TextInput
-                      testID="param-salts-input"
-                      value={salts}
-                      onChangeText={setSalts}
-                      placeholder="0.00"
-                      placeholderTextColor={colors.textMuted}
-                      keyboardType="decimal-pad"
-                      style={[styles.input, saltsIssue && styles.inputError]}
-                    />
-                    {saltsIssue ? <Text style={styles.inlineErr}>{saltsIssue}</Text> : null}
-                  </View>
-                ) : null}
-              </Card>
-            ) : null}
-
-            {phase === "end" && fields.length === 0 ? (
-              <Card style={{ marginTop: spacing.md }}>
-                <Label>Observational stage</Label>
-                <Text style={[type.bodySm, { marginTop: spacing.xs }]}>
-                  {stageMeta?.description}. No measured parameters — record photos, notes and the result.
-                </Text>
+                <Label>{stageMeta?.name} · Inspection Fields</Label>
+                {fieldDefs.map(renderField)}
               </Card>
             ) : null}
 
@@ -483,7 +536,7 @@ export default function StageFormScreen() {
               <Text style={type.caption}>
                 {phase === "start" ? "Record conditions to begin this stage" : "Ready to submit end-of-stage inspection"}
               </Text>
-              <StatusPill status={dftIssue?.hardBlock ? "fail" : gate.ok ? "pass" : "in_progress"} />
+              <StatusPill status={anyHardBlock ? "fail" : gate.ok ? "pass" : "in_progress"} />
             </View>
             {phase === "start" ? (
               <TouchableOpacity
@@ -523,11 +576,52 @@ export default function StageFormScreen() {
           </View>
         </KeyboardAvoidingView>
       )}
+
+      {/* generic dropdown picker */}
+      <Modal visible={!!pickerFor} animationType="slide" transparent onRequestClose={() => setPickerFor(null)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setPickerFor(null)}>
+          <Pressable style={styles.modalSheet} onPress={(e) => e.stopPropagation()}>
+            <View style={styles.modalHandle} />
+            <Text style={[type.h3, { marginBottom: spacing.sm }]}>{pickerFor?.label}</Text>
+            <ScrollView style={{ maxHeight: 360 }}>
+              {pickerFor && resolveOptions(pickerFor, paintOpts, values).length === 0 ? (
+                <Text style={[type.bodySm, { textAlign: "center", padding: spacing.lg }]}>No options available.</Text>
+              ) : (
+                pickerFor &&
+                resolveOptions(pickerFor, paintOpts, values).map((opt) => (
+                  <TouchableOpacity
+                    key={opt}
+                    testID={`option-${opt}`}
+                    onPress={() => {
+                      setValue(pickerFor.key, opt);
+                      // reset downstream dependent fields when a parent changes
+                      fieldDefs.forEach((d) => {
+                        if (d.depends_on === pickerFor.key) setValue(d.key, "");
+                      });
+                      setPickerFor(null);
+                    }}
+                    style={styles.specOption}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={type.body}>{opt}</Text>
+                    {values[pickerFor.key] === opt ? (
+                      <Ionicons name="checkmark-circle" size={20} color={colors.successText} />
+                    ) : null}
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+            <TouchableOpacity testID="picker-close" onPress={() => setPickerFor(null)} style={styles.modalClose}>
+              <Text style={[type.label, { color: colors.textPrimary }]}>CLOSE</Text>
+            </TouchableOpacity>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-function Field({
+function ReadingField({
   label,
   value,
   onChangeText,
@@ -588,4 +682,12 @@ const styles = StyleSheet.create({
   stickyBar: { padding: spacing.md, backgroundColor: colors.card, borderTopWidth: 1, borderTopColor: colors.border, gap: 10 },
   primaryCta: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: colors.brand, paddingVertical: 16, borderRadius: radius.button },
   primaryCtaText: { color: colors.textInverse, fontWeight: "800", letterSpacing: 1, fontSize: 13 },
+  toggleRow: { flexDirection: "row", gap: spacing.sm, marginTop: 6 },
+  toggleBtn: { flex: 1, paddingVertical: 14, alignItems: "center", borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, backgroundColor: colors.inputBg },
+  pickerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  modalBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", justifyContent: "flex-end" },
+  modalSheet: { backgroundColor: colors.card, borderTopLeftRadius: 16, borderTopRightRadius: 16, padding: spacing.md, paddingBottom: spacing.lg },
+  modalHandle: { alignSelf: "center", width: 44, height: 4, borderRadius: 2, backgroundColor: colors.border, marginBottom: spacing.sm },
+  modalClose: { alignItems: "center", paddingVertical: 12, marginTop: spacing.sm, borderTopWidth: 1, borderTopColor: colors.border },
+  specOption: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", padding: spacing.md, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, marginBottom: spacing.sm, backgroundColor: colors.inputBg },
 });

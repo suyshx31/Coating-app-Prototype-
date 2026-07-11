@@ -83,11 +83,61 @@ def _readings(end_surface=18.0, end_dew=9.5):
     }
 
 
-def _submit(auth, wo_id, stage_key, parameters, result="pass", readings=None):
-    body = {"readings": readings or _readings(), "parameters": parameters,
+def _submit(auth, wo_id, stage_key, fields, result="pass", readings=None):
+    body = {"readings": readings or _readings(), "fields": fields,
             "notes": "TEST", "photos": [], "result": result}
     return requests.post(f"{API}/work-orders/{wo_id}/stages/{stage_key}/submit",
                          json=body, headers=auth, timeout=15)
+
+
+def _stage_of(detail, stage_key):
+    return next(s for s in detail["stages"] if s["key"] == stage_key)
+
+
+def _valid_fields(detail, stage_key, **overrides):
+    """Build a passing field payload from the stage's own field definitions."""
+    stage = _stage_of(detail, stage_key)
+    vals = {}
+    for f in stage["fields"]:
+        t, k, opts = f["type"], f["key"], f.get("options", "")
+        if t == "ok_notok":
+            vals[k] = "OK"
+        elif t == "pass_fail":
+            vals[k] = "PASS"
+        elif t == "date":
+            vals[k] = "2027-01-01"
+        elif t in ("text", "note"):
+            vals[k] = "Test entry"
+        elif t == "dropdown":
+            if opts == "brands":
+                vals[k] = "JOTUN"
+            elif opts == "products.primer":
+                vals[k] = "RESIST 86"
+            elif opts == "products.intermediate":
+                vals[k] = "JOTACOTE UNIVERSAL N10"
+            elif opts == "products.top":
+                vals[k] = "JOTAMASTIC 90"
+            elif opts == "colors":
+                vals[k] = "Gray"
+            # shades / ral are optional stubs with no options yet — skip
+        elif t in ("number", "decimal"):
+            rng = f.get("range")
+            if rng == "pct":
+                vals[k] = 68
+            elif rng == "anchor_profile":
+                lo = detail["spec"]["surface_profile_min_um"] / 25.4
+                hi = detail["spec"]["surface_profile_max_um"] / 25.4
+                vals[k] = round((lo + hi) / 2, 2)
+            elif rng == "dft_window":
+                lo, hi = detail["coat_limits"][stage["dft_window"]]
+                vals[k] = (lo + hi) / 2
+            elif rng == "wft":
+                lo, hi = detail["coat_limits"][stage["dft_window"]]
+                vals[k] = round(((lo + hi) / 2) * 100 / 68, 1)  # solids=68 above
+            else:
+                vals[k] = 1
+    vals.update(overrides)
+    return {k: v for k, v in vals.items() if v is not None}
 
 
 # ---------- Auth ----------
@@ -208,36 +258,67 @@ class TestWorkOrders:
         assert any(w["work_order_id"] == created["work_order_id"] for w in r.json())
 
 
-# ---------- Stage validation per case ----------
+# ---------- Stage validation per case (field definitions) ----------
 class TestStageValidation:
-    def test_surface_prep_profile_out_of_spec_fails(self, auth, spec):
+    def test_surface_prep_profile_out_of_window_fails(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
-        # anchor profile window is 25.4-63.5 µm for this spec; 5 µm is below it
+        detail = _detail(auth, wo["work_order_id"])
+        # anchor window for this spec is 1-2.5 mils; 0.2 is below it
         r = _submit(auth, wo["work_order_id"], "surface_prep",
-                    {"surface_profile_um": 5, "soluble_salts_mg_m2": 10})
+                    _valid_fields(detail, "surface_prep", surface_profile_mils=0.2))
         assert r.status_code == 200, r.text
         assert r.json()["result"] == "fail"
 
-    def test_surface_prep_missing_param_rejected(self, auth, spec):
+    def test_surface_prep_oil_water_not_ok_fails(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
-        r = _submit(auth, wo["work_order_id"], "surface_prep", {"surface_profile_um": 40})
-        assert r.status_code == 400  # soluble_salts_mg_m2 required at this stage
+        detail = _detail(auth, wo["work_order_id"])
+        r = _submit(auth, wo["work_order_id"], "surface_prep",
+                    _valid_fields(detail, "surface_prep", oil_water_test="NOT_OK"))
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
+
+    def test_missing_required_field_rejected(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        fields = _valid_fields(detail, "primer_coat")
+        del fields["operator_name"]
+        r = _submit(auth, wo["work_order_id"], "primer_coat", fields)
+        assert r.status_code == 400
+        assert "operator_name" in r.json()["detail"]
 
     def test_primer_window_hard_block(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
         detail = _detail(auth, wo["work_order_id"])
         _, primer_hi = detail["coat_limits"]["primer"]
-        r = _submit(auth, wo["work_order_id"], "primer_coat", {"dft_um": primer_hi + 100})
+        r = _submit(auth, wo["work_order_id"], "primer_coat",
+                    _valid_fields(detail, "primer_coat", dft_um=primer_hi + 100))
         assert r.status_code == 422, r.text
         assert r.json()["detail"]["hard_block"] is True
+
+    def test_primer_visual_not_ok_fails(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        r = _submit(auth, wo["work_order_id"], "primer_coat",
+                    _valid_fields(detail, "primer_coat", visual_inspection="NOT_OK"))
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
+
+    def test_wft_out_of_derived_window_fails(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        # WFT window = DFT window / (solids/100); 9999 is far above any window
+        r = _submit(auth, wo["work_order_id"], "primer_coat",
+                    _valid_fields(detail, "primer_coat", wft_um=9999))
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
 
     def test_intermediate_uses_cumulative_window(self, auth, spec):
         wo = _create_wo(auth, spec, "primer_intermediate")
         detail = _detail(auth, wo["work_order_id"])
-        lo, hi = detail["coat_limits"]["mid_cumulative"]
-        stage = next(s for s in detail["stages"] if s["key"] == "intermediate_coat")
+        stage = _stage_of(detail, "intermediate_coat")
         assert stage["dft_window"] == "mid_cumulative"
-        r = _submit(auth, wo["work_order_id"], "intermediate_coat", {"dft_um": (lo + hi) / 2})
+        r = _submit(auth, wo["work_order_id"], "intermediate_coat",
+                    _valid_fields(detail, "intermediate_coat"))
         assert r.status_code == 200, r.text
         assert r.json()["result"] == "pass"
 
@@ -247,39 +328,96 @@ class TestStageValidation:
         lo, hi = detail["coat_limits"]["top"]
         total_hi = detail["coat_limits"]["total"][1]
         assert hi < total_hi  # the standalone window is tighter than full-system
-        stage = next(s for s in detail["stages"] if s["key"] == "top_coat")
-        assert stage["dft_window"] == "top"
-        ok = _submit(auth, wo["work_order_id"], "top_coat", {"dft_um": (lo + hi) / 2})
+        assert _stage_of(detail, "top_coat")["dft_window"] == "top"
+        ok = _submit(auth, wo["work_order_id"], "top_coat", _valid_fields(detail, "top_coat"))
         assert ok.status_code == 200 and ok.json()["result"] == "pass"
         # over the top window (but under total) must still hard-block
         wo2 = _create_wo(auth, spec, "top_coat_only")
-        blocked = _submit(auth, wo2["work_order_id"], "top_coat", {"dft_um": hi + 50})
+        detail2 = _detail(auth, wo2["work_order_id"])
+        blocked = _submit(auth, wo2["work_order_id"], "top_coat",
+                          _valid_fields(detail2, "top_coat", dft_um=hi + 50))
         assert blocked.status_code == 422
         assert blocked.json()["detail"]["hard_block"] is True
 
-    def test_curing_qa_observational_pass_and_fail(self, auth, spec):
+    def test_curing_qa_requires_batch_expiry_per_case(self, auth, spec):
+        # only_primer: primer batch/expiry required, no top keys
         wo = _create_wo(auth, spec, "only_primer")
-        r = _submit(auth, wo["work_order_id"], "curing_qa", {})
-        assert r.status_code == 200, r.text
-        assert r.json()["result"] == "pass"
-        wo2 = _create_wo(auth, spec, "only_primer")
-        r2 = _submit(auth, wo2["work_order_id"], "curing_qa", {}, result="fail")
-        assert r2.status_code == 200
-        assert r2.json()["result"] == "fail"
+        detail = _detail(auth, wo["work_order_id"])
+        keys = {f["key"] for f in _stage_of(detail, "curing_qa")["fields"]}
+        assert {"batch_number_primer", "expiry_date_primer"} <= keys
+        assert "batch_number_top" not in keys
+        r = _submit(auth, wo["work_order_id"], "curing_qa", {"mek_test": "PASS", "curing_room_temp": "OK"})
+        assert r.status_code == 400
+        assert "batch_number_primer" in r.json()["detail"]
+        # top_coat_only: top batch/expiry required, no primer keys
+        wo2 = _create_wo(auth, spec, "top_coat_only")
+        detail2 = _detail(auth, wo2["work_order_id"])
+        keys2 = {f["key"] for f in _stage_of(detail2, "curing_qa")["fields"]}
+        assert {"batch_number_top", "expiry_date_top"} <= keys2
+        assert "batch_number_primer" not in keys2
+        ok = _submit(auth, wo2["work_order_id"], "curing_qa", _valid_fields(detail2, "curing_qa"))
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["result"] == "pass"
+
+    def test_curing_qa_mek_fail_marks_fail(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        r = _submit(auth, wo["work_order_id"], "curing_qa",
+                    _valid_fields(detail, "curing_qa", mek_test="FAIL"))
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
+
+    def test_curing_qa_bad_expiry_date_fails(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        r = _submit(auth, wo["work_order_id"], "curing_qa",
+                    _valid_fields(detail, "curing_qa", expiry_date_primer="15-03-2027"))
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
+        assert any("invalid date" in e for e in r.json()["errors"])
 
     def test_stage_not_in_case_404(self, auth, spec):
         wo = _create_wo(auth, spec, "top_coat_only")  # has no primer_coat
-        r = _submit(auth, wo["work_order_id"], "primer_coat", {"dft_um": 120})
+        r = _submit(auth, wo["work_order_id"], "primer_coat", {})
         assert r.status_code == 404
 
-    def test_gate_fails_when_surface_not_gt_dew_plus_3(self, auth, spec):
+    def test_gate_dew_point_fails_with_specific_reason(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
         detail = _detail(auth, wo["work_order_id"])
-        lo, hi = detail["coat_limits"]["primer"]
-        r = _submit(auth, wo["work_order_id"], "primer_coat", {"dft_um": (lo + hi) / 2},
+        r = _submit(auth, wo["work_order_id"], "primer_coat", _valid_fields(detail, "primer_coat"),
                     readings=_readings(end_surface=10.0, end_dew=9.8))
         assert r.status_code == 200
         assert r.json()["result"] == "fail"
+        assert any("dew point" in e for e in r.json()["errors"])
+
+    def test_gate_too_hot_fails_with_specific_reason(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        r = _submit(auth, wo["work_order_id"], "primer_coat", _valid_fields(detail, "primer_coat"),
+                    readings=_readings(end_surface=65.0, end_dew=9.8))
+        assert r.status_code == 200
+        assert r.json()["result"] == "fail"
+        assert any("Too hot for coat" in e for e in r.json()["errors"])
+
+    def test_start_blocked_when_too_hot(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        r = requests.post(
+            f"{API}/work-orders/{wo['work_order_id']}/stages/surface_prep/start",
+            json={"readings": {"ambient_temp_c": 40, "relative_humidity_pct": 30,
+                               "dew_point_c": 15, "surface_temp_c": 65}},
+            headers=auth, timeout=15)
+        assert r.status_code == 422
+        assert any("Too hot for coat" in e for e in r.json()["detail"]["errors"])
+
+    def test_start_blocked_when_too_close_to_dew_point(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        r = requests.post(
+            f"{API}/work-orders/{wo['work_order_id']}/stages/surface_prep/start",
+            json={"readings": {"ambient_temp_c": 20, "relative_humidity_pct": 80,
+                               "dew_point_c": 14, "surface_temp_c": 16}},
+            headers=auth, timeout=15)
+        assert r.status_code == 422
+        assert any("dew point" in e for e in r.json()["detail"]["errors"])
 
 
 # ---------- Two-step start/end flow ----------
@@ -304,11 +442,10 @@ class TestTwoStepFlow:
         assert stg["status"] == "in_progress"
         assert stg["start_readings"]["surface_temp_c"] == 17.5
 
-        lo, hi = detail["coat_limits"]["primer"]
         submit_body = {
             "readings": {"end": {"ambient_temp_c": 22.0, "relative_humidity_pct": 45.0,
                                  "dew_point_c": 9.5, "surface_temp_c": 18.0}},
-            "parameters": {"dft_um": (lo + hi) / 2},
+            "fields": _valid_fields(detail, "primer_coat"),
             "notes": "TEST two-step", "photos": [], "result": "pass",
         }
         r3 = requests.post(f"{API}/work-orders/{wo_id}/stages/primer_coat/submit",
@@ -354,8 +491,7 @@ class TestAuditAndHistory:
     def test_audit_log_has_entries(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
         detail = _detail(auth, wo["work_order_id"])
-        lo, hi = detail["coat_limits"]["primer"]
-        _submit(auth, wo["work_order_id"], "primer_coat", {"dft_um": (lo + hi) / 2})
+        _submit(auth, wo["work_order_id"], "primer_coat", _valid_fields(detail, "primer_coat"))
         time.sleep(0.5)
         r = requests.get(f"{API}/work-orders/{wo['work_order_id']}/audit-log", headers=auth, timeout=15)
         assert r.status_code == 200

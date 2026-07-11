@@ -73,6 +73,7 @@ export const api = {
   dashboard: () => request<Dashboard>(`/dashboard`),
   coatingSpecs: () => request<CoatingSpec[]>(`/coating-specifications`),
   caseTypes: () => request<CaseTypeInfo[]>(`/case-types`),
+  paintOptions: () => request<PaintOptions>(`/paint-options`),
   createWorkOrder: (body: CreateWorkOrderBody) =>
     request<WorkOrderSummary>(`/work-orders`, { method: "POST", body: JSON.stringify(body) }),
 };
@@ -163,6 +164,28 @@ export type StageReadings = {
 
 export type DftWindow = "primer" | "mid_cumulative" | "top" | "total";
 
+// Typed field descriptor snapshotted onto each stage from its case-type template.
+export type FieldDef = {
+  key: string;
+  label: string;
+  type: "dropdown" | "ok_notok" | "pass_fail" | "number" | "decimal" | "text" | "date" | "note";
+  unit?: string;
+  required?: boolean;
+  fail_on?: string;
+  range?: "anchor_profile" | "dft_window" | "wft" | "pct";
+  hard_block_max?: boolean;
+  options?: string;      // brands | products.<coat> | colors | shades | ral
+  depends_on?: string;   // key of the field that filters this dropdown
+};
+
+export type PaintOptions = {
+  brands: string[];
+  products: Record<string, { primer: string[]; intermediate: string[]; top: string[] }>;
+  colors: string[];
+  shades: Record<string, string[]>; // keyed "BRAND::PRODUCT"
+  ral: string[];                    // stub, unpopulated
+};
+
 export type Stage = {
   key: string;
   name: string;
@@ -179,6 +202,7 @@ export type Stage = {
   // snapshot from the case-type template: which measured params this stage takes
   params: string[];
   dft_window: DftWindow | null;
+  fields: FieldDef[];
 };
 
 // DFT windows (µm) per coat stage, from the paint-system spec.

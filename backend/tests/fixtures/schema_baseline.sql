@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict R83xWHdZf2cCp3kXafiN0SsQ8AzXP7Oi7Qpeg7z5JtqvhVKUvhhQKs3BPv6fK12
+\restrict YJgulE3MQTCHsi8jVLfxSo0QJKWLixW3FNB9r318LocC5nnuf5ekZzac2IQQGqs
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Debian 17.10-1.pgdg13+1)
@@ -77,7 +77,8 @@ CREATE TABLE public.case_type_stage_templates (
     description text NOT NULL,
     requires_coat_readings boolean DEFAULT false NOT NULL,
     params jsonb DEFAULT '[]'::jsonb NOT NULL,
-    dft_window text
+    dft_window text,
+    fields jsonb DEFAULT '[]'::jsonb NOT NULL
 );
 
 
@@ -185,7 +186,8 @@ CREATE TABLE public.work_order_stages (
     started_by text,
     start_readings jsonb,
     params jsonb DEFAULT '[]'::jsonb NOT NULL,
-    dft_window text
+    dft_window text,
+    fields jsonb DEFAULT '[]'::jsonb NOT NULL
 );
 
 
@@ -424,5 +426,5 @@ ALTER TABLE ONLY public.work_orders
 -- PostgreSQL database dump complete
 --
 
-\unrestrict R83xWHdZf2cCp3kXafiN0SsQ8AzXP7Oi7Qpeg7z5JtqvhVKUvhhQKs3BPv6fK12
+\unrestrict YJgulE3MQTCHsi8jVLfxSo0QJKWLixW3FNB9r318LocC5nnuf5ekZzac2IQQGqs
 
