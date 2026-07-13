@@ -22,8 +22,11 @@ import json
 import logging
 import os
 import random
+import smtplib
+from email.message import EmailMessage
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -31,10 +34,13 @@ import asyncpg
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, APIRouter, HTTPException
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
+
+import reports as report_gen
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -128,6 +134,10 @@ class StageReadingPair(BaseModel):
 
 class StageStartRequest(BaseModel):
     readings: StageReadings = Field(default_factory=StageReadings)
+    # start-phase field values (paint identification, operator, batch/expiry
+    # on curing_qa) and before-work photos
+    fields: dict = Field(default_factory=dict)
+    photos: List[str] = Field(default_factory=list)
 
 class StageSubmission(BaseModel):
     readings: StageReadingPair
@@ -391,17 +401,25 @@ def _field_range(wo: dict, stage: dict, fdef: dict, values: dict):
     return None
 
 
-def _validate_stage_fields(wo: dict, stage: dict, values: dict):
-    """Validate submitted values against the stage's field definitions.
+def _validate_stage_fields(wo: dict, stage: dict, values: dict, phase: str = "end",
+                           range_context: Optional[dict] = None):
+    """Validate submitted values against the stage's field definitions for one
+    capture phase ("start" = paint identification at stage start, "end" =
+    results at submission; defs without a phase default to "end").
 
     Returns (missing_keys, errors, hard_block). fail_on values and
     out-of-range numbers produce errors (stage result -> fail); DFT fields
     marked hard_block_max escalate over-max to a submission hard block.
+    range_context supplies values from the other phase for derived windows
+    (e.g. WFT depends on volume % solids captured at start).
     """
     missing: List[str] = []
     errors: List[str] = []
     hard_block = False
+    lookup = {**(range_context or {}), **values}
     for f in stage.get("fields") or []:
+        if f.get("phase", "end") != phase:
+            continue
         key, ftype = f["key"], f["type"]
         label = f.get("label", key)
         val = values.get(key)
@@ -415,7 +433,7 @@ def _validate_stage_fields(wo: dict, stage: dict, values: dict):
             except (TypeError, ValueError):
                 errors.append(f"{label}: '{val}' is not a number")
                 continue
-            window = _field_range(wo, stage, f, values)
+            window = _field_range(wo, stage, f, lookup)
             if window:
                 lo, hi = window
                 unit = f.get("unit", "")
@@ -442,6 +460,11 @@ def _validate_stage_fields(wo: dict, stage: dict, values: dict):
                 date.fromisoformat(str(val))
             except ValueError:
                 errors.append(f"{label}: invalid date, expected YYYY-MM-DD")
+        elif ftype == "time":
+            try:
+                dt_time.fromisoformat(str(val))
+            except ValueError:
+                errors.append(f"{label}: invalid time, expected HH:MM")
         # text / note / dropdown: presence is the only server-side requirement
     return missing, errors, hard_block
 
@@ -471,6 +494,8 @@ def _stage_dict(row) -> dict:
         "params": row["params"],
         "dft_window": row["dft_window"],
         "fields": row["fields"],
+        "start_fields": row["start_fields"],
+        "start_photos": row["start_photos"],
     }
 
 
@@ -661,48 +686,55 @@ async def list_case_types(_=Depends(get_current_user)):
 # ---- paint options (feeds stage-form dropdowns) ----
 @api.get("/paint-options")
 async def paint_options(_=Depends(get_current_user)):
-    """Dropdown options derived from existing data — approved_paint_suppliers
-    (brands) and paint_system_specifications' denormalized columns (products
-    per brand/coat, colors, shades). The normalized Brand/Product/Shade lookup
-    tables are on hold; this endpoint is read-only derivation, not new schema.
-    Product strings are deduped case-insensitively (source sheet mixes cases).
-    `ral` is a stub — structure present, deliberately unpopulated.
+    """Dropdown options for stage forms.
+
+    Brands/products/shades come from the normalized lookup tables
+    (paint_products / paint_shades, deduped in migration 0007); RAL from the
+    seeded RAL Classic chart; operators from the operators table. Colors stay
+    derived from the spec sheet (no lookup table exists for them yet).
+    RAL <-> paint-shade auto-matching is deliberately NOT provided — the two
+    dropdowns are independent until official manufacturer equivalence data
+    exists.
     """
     assert pool is not None
     brands = [r["supplier_name"] for r in
               await pool.fetch("select supplier_name from approved_paint_suppliers order by 1")]
-    rows = await pool.fetch(
-        """select paint_brand, primer_paint_product, intermediate_coat_product, top_coat_product,
-                  primer_coat_color, intermediate_coat_color, top_coat_paint_shade
-           from paint_system_specifications"""
-    )
+
     products: dict = {b: {"primer": [], "intermediate": [], "top": []} for b in brands}
-    colors: set = set()
+    for r in await pool.fetch("select brand, product_name, coat_roles from paint_products order by brand, product_name"):
+        for role in r["coat_roles"]:
+            if r["brand"] in products and role in products[r["brand"]]:
+                products[r["brand"]][role].append(r["product_name"])
+
     shades: dict = {}
+    for r in await pool.fetch(
+        """select pp.brand, pp.product_name, ps.shade_name
+           from paint_shades ps join paint_products pp on pp.id = ps.product_id
+           order by pp.brand, pp.product_name, ps.shade_name"""
+    ):
+        shades.setdefault(f"{r['brand']}::{r['product_name']}", []).append(r["shade_name"])
 
-    def add_product(brand, coat, name):
-        if not brand or not name or brand not in products:
-            return
-        bucket = products[brand][coat]
-        if name.upper() not in {p.upper() for p in bucket}:
-            bucket.append(name)
+    color_rows = await pool.fetch(
+        """select distinct c from (
+             select primer_coat_color as c from paint_system_specifications
+             union select intermediate_coat_color from paint_system_specifications
+           ) t where c is not null order by 1"""
+    )
 
-    for r in rows:
-        add_product(r["paint_brand"], "primer", r["primer_paint_product"])
-        add_product(r["paint_brand"], "intermediate", r["intermediate_coat_product"])
-        add_product(r["paint_brand"], "top", r["top_coat_product"])
-        for c in (r["primer_coat_color"], r["intermediate_coat_color"]):
-            if c:
-                colors.add(c)
-        if r["top_coat_paint_shade"] and r["paint_brand"] and r["top_coat_product"]:
-            shades.setdefault(f"{r['paint_brand']}::{r['top_coat_product']}", []).append(r["top_coat_paint_shade"])
+    ral = [f"{r['ral_number']} · {r['colour_name']}" for r in
+           await pool.fetch("select ral_number, colour_name from ral_shades order by ral_number")]
+
+    operators = [{"name": r["name"], "designation": r["designation"]} for r in
+                 await pool.fetch("select name, designation from operators where active order by name")]
 
     return {
         "brands": brands,
         "products": products,          # products[brand][primer|intermediate|top]
-        "colors": sorted(colors),      # brand-agnostic
-        "shades": shades,              # keyed "BRAND::PRODUCT" (empty until data exists)
-        "ral": [],                     # stub: standard RAL chart, not populated yet
+        "colors": [r["c"] for r in color_rows],
+        "shades": shades,              # keyed "BRAND::PRODUCT"
+        "ral": ral,                    # "RAL 3001 · Signal red" (217 rows)
+        "operators": operators,        # [{name, designation}]
+        "operator_designations": sorted({o["designation"] for o in operators}),
     }
 
 
@@ -906,12 +938,24 @@ async def start_stage(
             if gate:
                 raise HTTPException(status_code=422, detail={"gate_failed": True, "errors": gate})
 
+        # start-phase fields (paint identification / operator / batch+expiry):
+        # required ones must be present and valid before work begins
+        wos = await _fetch_work_orders(conn, work_order_id)
+        stage_dict = next(s for s in wos[0]["stages"] if s["key"] == stage_key)
+        missing, errors, _ = _validate_stage_fields(wos[0], stage_dict, body.fields or {}, phase="start")
+        if missing:
+            raise HTTPException(400, f"Missing required start-of-stage fields for '{stage_key}': {', '.join(missing)}")
+        if errors:
+            raise HTTPException(status_code=422, detail={"start_fields_invalid": True, "errors": errors})
+
         started_at = datetime.now(timezone.utc)
         await conn.execute(
             """update work_order_stages
-               set status = 'in_progress', started_at = $3, started_by = $4, start_readings = $5
+               set status = 'in_progress', started_at = $3, started_by = $4, start_readings = $5,
+                   start_fields = $6, start_photos = $7
                where work_order_id = $1 and stage_key = $2""",
             wo_row["id"], stage_key, started_at, current["employee_id"], body.readings.model_dump(),
+            body.fields or {}, (body.photos or [])[:5],
         )
     await write_audit(work_order_id, stage_key, current, "stage_started",
                       f"Stage '{stage_key}' started by {current['employee_id']}")
@@ -936,8 +980,12 @@ async def submit_stage(
             raise HTTPException(404, f"Stage '{stage_key}' does not exist on this work order")
 
         # ---- server-side validation from the stage's field definitions ----
+        # end-phase only; start-phase values were validated and stored at /start
+        # (they also feed derived ranges, e.g. WFT needs start-phase % solids)
         values = body.fields or {}
-        missing, errors, hard_block = _validate_stage_fields(wo, stage, values)
+        start_values = stage.get("start_fields") or {}
+        missing, errors, hard_block = _validate_stage_fields(
+            wo, stage, values, phase="end", range_context=start_values)
         if missing:
             raise HTTPException(400, f"Missing required fields for stage '{stage_key}': {', '.join(missing)}")
 
@@ -963,7 +1011,9 @@ async def submit_stage(
         submitted_at = datetime.now(timezone.utc)
         submission = {
             "readings": {"start": start_readings, "end": end.model_dump()},
-            "fields": values,
+            # full record: start-phase identification + end-phase results
+            "fields": {**start_values, **values},
+            "start_photos": stage.get("start_photos") or [],
             "notes": body.notes or "",
             "photos": body.photos[:5],
             "result": result,
@@ -1088,6 +1138,110 @@ async def dashboard(current=Depends(get_current_user)):
         "last_sync": now_iso(),
         "current_assignment": current_wo,
     }
+
+
+# ---------- reports & distribution ----------
+class RecipientIn(BaseModel):
+    name: str = Field(..., min_length=1)
+    email: EmailStr
+
+class SendReportRequest(BaseModel):
+    recipients: List[EmailStr] = Field(..., min_length=1)
+    formats: List[Literal["pdf", "xlsx"]] = Field(default_factory=lambda: ["pdf"])
+    message: Optional[str] = ""
+
+
+@api.get("/report-recipients")
+async def list_recipients(_=Depends(get_current_user)):
+    assert pool is not None
+    rows = await pool.fetch("select id, name, email from report_recipients order by name")
+    return [{"id": str(r["id"]), "name": r["name"], "email": r["email"]} for r in rows]
+
+
+@api.post("/report-recipients", status_code=201)
+async def add_recipient(body: RecipientIn, _=Depends(get_current_user)):
+    assert pool is not None
+    row = await pool.fetchrow(
+        """insert into report_recipients (name, email) values ($1, $2)
+           on conflict (email) do update set name = excluded.name
+           returning id, name, email""",
+        body.name, body.email.lower(),
+    )
+    return {"id": str(row["id"]), "name": row["name"], "email": row["email"]}
+
+
+async def _build_report(conn, work_order_id: str, fmt: str, actor: dict) -> tuple[str, bytes]:
+    """Generate a report, persist a cloud-backed copy, return (filename, bytes)."""
+    wos = await _fetch_work_orders(conn, work_order_id)
+    if not wos:
+        raise HTTPException(404, "Work order not found")
+    wo = wos[0]
+    company_row = await conn.fetchrow(
+        "select company_name, logo_url from spec_company_logos where specification = $1",
+        wo["paint_product_code"],
+    )
+    data = report_gen.collect_report_data(wo, dict(company_row) if company_row else None)
+    content = report_gen.generate_pdf(data) if fmt == "pdf" else report_gen.generate_xlsx(data)
+    filename = f"paint-report-{work_order_id}.{fmt}"
+    await conn.execute(
+        """insert into generated_reports (work_order_id, format, filename, content, created_by)
+           values ($1, $2, $3, $4, $5)""",
+        work_order_id, fmt, filename, content, actor["employee_id"],
+    )
+    return filename, content
+
+
+@api.get("/work-orders/{work_order_id}/report")
+async def download_report(work_order_id: str, format: Literal["pdf", "xlsx"] = "pdf",
+                          current=Depends(get_current_user)):
+    assert pool is not None
+    async with pool.acquire() as conn:
+        filename, content = await _build_report(conn, work_order_id, format, current)
+    await write_audit(work_order_id, None, current, "report_generated", f"{format.upper()} report generated")
+    media = "application/pdf" if format == "pdf" else \
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return Response(content=content, media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@api.post("/work-orders/{work_order_id}/report/send")
+async def send_report(work_order_id: str, body: SendReportRequest, current=Depends(get_current_user)):
+    gmail_user = os.environ.get("GMAIL_USER", "")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
+    if not gmail_user or not gmail_pass:
+        raise HTTPException(503, "Email not configured: set GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env")
+
+    assert pool is not None
+    async with pool.acquire() as conn:
+        attachments = [await _build_report(conn, work_order_id, fmt, current) for fmt in body.formats]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Final Paint Report — {work_order_id}"
+    msg["From"] = gmail_user
+    msg["To"] = ", ".join(body.recipients)
+    msg.set_content(body.message or f"Please find attached the final paint report for {work_order_id}.")
+    for filename, content in attachments:
+        maintype, subtype = ("application", "pdf") if filename.endswith(".pdf") else \
+            ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
+
+    import asyncio as _asyncio
+
+    def _send():
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(gmail_user, gmail_pass)
+            smtp.send_message(msg)
+
+    try:
+        await _asyncio.get_running_loop().run_in_executor(None, _send)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(502, "Gmail rejected the credentials (use an App Password, not the account password)")
+    except (smtplib.SMTPException, OSError) as e:
+        raise HTTPException(502, f"Email send failed: {e}")
+
+    await write_audit(work_order_id, None, current, "report_sent",
+                      f"Report ({', '.join(body.formats)}) emailed to {', '.join(body.recipients)}")
+    return {"ok": True, "sent_to": body.recipients, "formats": body.formats}
 
 
 app.include_router(api)

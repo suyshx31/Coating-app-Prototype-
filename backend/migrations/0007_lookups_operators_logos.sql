@@ -1,0 +1,302 @@
+-- Phase 1 (UI-restructure batch): operators, inspector shifts, spec/company
+-- logos, Brand -> Product -> Shade lookups (deduped), RAL Classic seed.
+-- Touches only NEW tables + additive columns on inspectors. Does not modify
+-- paint_system_specifications, approved_paint_suppliers, work_orders,
+-- work_order_stages, or any workflow data.
+
+-- 1. Operators (selected via dropdown on coat stages; replaces free text)
+create table operators (
+    id uuid primary key default gen_random_uuid(),
+    name text not null,
+    designation text not null,
+    employee_code text unique,          -- optional company identifier
+    active boolean not null default true,
+    created_at timestamptz not null default now(),
+    unique (name, designation)
+);
+
+-- Seed the one operator observed in real submissions so existing data has a
+-- counterpart row (WO-2026-0031 primer coat: Mr.Kishore / Painter).
+insert into operators (name, designation) values ('Mr.Kishore', 'Painter');
+
+-- 2. Inspector shift structure (table already exists as the login table;
+--    existing free-label `shift` column is kept untouched)
+alter table inspectors
+    add column if not exists shift_label text,        -- e.g. Morning / Evening / Night
+    add column if not exists shift_start time,        -- e.g. 06:00
+    add column if not exists shift_end   time;        -- e.g. 14:00
+
+-- 3. Spec -> Company -> Logo mapping (structure only; logo files + real
+--    mapping data to be provided separately)
+create table spec_company_logos (
+    id uuid primary key default gen_random_uuid(),
+    specification text not null unique,   -- matches paint_system_specifications.specification
+    company_name text not null,
+    logo_url text,                        -- storage file reference/URL, null until provided
+    created_at timestamptz not null default now()
+);
+
+-- 4. Brand -> Product -> Shade lookups.
+-- Products deduped from paint_system_specifications' denormalized columns:
+-- 14 raw strings -> 12 canonical products (case-dupes merged, uppercase
+-- canonical; MIO variants kept distinct — different formulations).
+-- coat_roles = which coat positions the product appears in across specs.
+create table paint_products (
+    id uuid primary key default gen_random_uuid(),
+    brand text not null references approved_paint_suppliers(supplier_name),
+    product_name text not null,
+    coat_roles text[] not null default '{}',
+    unique (brand, product_name)
+);
+
+insert into paint_products (brand, product_name, coat_roles) values
+('CARBOLINE', 'CARBOZINC 11',              '{primer}'),
+('CARBOLINE', 'CARBOZINC 858',             '{primer}'),
+('CARBOLINE', 'CARBOGUARD 890',            '{intermediate}'),
+('CARBOLINE', 'CARBOGUARD 890 MIO',        '{intermediate}'),
+('CARBOLINE', 'CARBOTHANE 134 HG',         '{top}'),
+('JOTUN',     'RESIST 86',                 '{primer}'),
+('JOTUN',     'BARRIER 90X',               '{primer}'),
+('JOTUN',     'JOTACOTE UNIVERSAL N10',    '{intermediate}'),
+('JOTUN',     'JOTACOTE UNIVERSAL N10 MIO','{intermediate}'),
+('JOTUN',     'PENGUARD MIDCOAT MIO',      '{intermediate}'),
+('JOTUN',     'JOTAMASTIC 90',             '{top}'),
+('JOTUN',     'HARDTOP XP',                '{top}');
+
+create table paint_shades (
+    id uuid primary key default gen_random_uuid(),
+    product_id uuid not null references paint_products(id) on delete cascade,
+    shade_name text not null,
+    unique (product_id, shade_name)
+);
+-- No shade rows seeded: the spec sheet's top_coat_paint_shade column is
+-- entirely NULL. Table is ready for real shade data when provided.
+
+-- 5. RAL Classic chart (seeded from migrations/seed/ral_shade_seed_data.csv,
+--    217 verified rows; two wiki-footnote artifacts stripped from names)
+create table ral_shades (
+    ral_number text primary key,          -- "RAL 3001"
+    colour_name text not null,            -- "Signal red"
+    colour_family text not null           -- Yellow/Orange/Red/Violet/Blue/Green/Grey/Brown/White and black
+);
+
+insert into ral_shades (ral_number, colour_name, colour_family) values
+('RAL 1000', 'Green beige', 'Yellow'),
+('RAL 1001', 'Beige', 'Yellow'),
+('RAL 1002', 'Sand yellow', 'Yellow'),
+('RAL 1003', 'Signal yellow', 'Yellow'),
+('RAL 1004', 'Golden yellow', 'Yellow'),
+('RAL 1005', 'Honey yellow', 'Yellow'),
+('RAL 1006', 'Maize yellow', 'Yellow'),
+('RAL 1007', 'Daffodil yellow', 'Yellow'),
+('RAL 1011', 'Brown beige', 'Yellow'),
+('RAL 1012', 'Lemon yellow', 'Yellow'),
+('RAL 1013', 'Oyster white', 'Yellow'),
+('RAL 1014', 'Ivory', 'Yellow'),
+('RAL 1015', 'Light ivory', 'Yellow'),
+('RAL 1016', 'Sulfur yellow', 'Yellow'),
+('RAL 1017', 'Saffron yellow', 'Yellow'),
+('RAL 1018', 'Zinc yellow', 'Yellow'),
+('RAL 1019', 'Grey beige', 'Yellow'),
+('RAL 1020', 'Olive yellow', 'Yellow'),
+('RAL 1021', 'Colza yellow', 'Yellow'),
+('RAL 1023', 'Traffic yellow', 'Yellow'),
+('RAL 1024', 'Ochre yellow', 'Yellow'),
+('RAL 1026', 'Luminous yellow', 'Yellow'),
+('RAL 1027', 'Curry', 'Yellow'),
+('RAL 1028', 'Melon yellow', 'Yellow'),
+('RAL 1032', 'Broom yellow', 'Yellow'),
+('RAL 1033', 'Dahlia yellow', 'Yellow'),
+('RAL 1034', 'Pastel yellow', 'Yellow'),
+('RAL 1035', 'Pearl beige', 'Yellow'),
+('RAL 1036', 'Pearl gold', 'Yellow'),
+('RAL 1037', 'Sun yellow', 'Yellow'),
+('RAL 2000', 'Yellow orange', 'Orange'),
+('RAL 2001', 'Red orange', 'Orange'),
+('RAL 2002', 'Blood orange', 'Orange'),
+('RAL 2003', 'Pastel orange', 'Orange'),
+('RAL 2004', 'Pure orange', 'Orange'),
+('RAL 2005', 'Luminous orange', 'Orange'),
+('RAL 2007', 'Luminous bright orange', 'Orange'),
+('RAL 2008', 'Bright red orange', 'Orange'),
+('RAL 2009', 'Traffic orange', 'Orange'),
+('RAL 2010', 'Signal orange', 'Orange'),
+('RAL 2011', 'Deep orange', 'Orange'),
+('RAL 2012', 'Salmon orange', 'Orange'),
+('RAL 2013', 'Pearl orange', 'Orange'),
+('RAL 2017', 'RAL orange', 'Orange'),
+('RAL 3000', 'Flame red', 'Red'),
+('RAL 3001', 'Signal red', 'Red'),
+('RAL 3002', 'Carmine red', 'Red'),
+('RAL 3003', 'Ruby red', 'Red'),
+('RAL 3004', 'Purple red', 'Red'),
+('RAL 3005', 'Wine red', 'Red'),
+('RAL 3007', 'Black red', 'Red'),
+('RAL 3009', 'Oxide red', 'Red'),
+('RAL 3011', 'Brown red', 'Red'),
+('RAL 3012', 'Beige red', 'Red'),
+('RAL 3013', 'Tomato red', 'Red'),
+('RAL 3014', 'Antique pink', 'Red'),
+('RAL 3015', 'Light pink', 'Red'),
+('RAL 3016', 'Coral red', 'Red'),
+('RAL 3017', 'Rose', 'Red'),
+('RAL 3018', 'Strawberry red', 'Red'),
+('RAL 3020', 'Traffic red', 'Red'),
+('RAL 3022', 'Salmon pink', 'Red'),
+('RAL 3024', 'Luminous red', 'Red'),
+('RAL 3026', 'Luminous bright red', 'Red'),
+('RAL 3027', 'Raspberry red', 'Red'),
+('RAL 3028', 'Pure red', 'Red'),
+('RAL 3031', 'Orient red', 'Red'),
+('RAL 3032', 'Pearl ruby red', 'Red'),
+('RAL 3033', 'Pearl pink', 'Red'),
+('RAL 4001', 'Red lilac', 'Violet'),
+('RAL 4002', 'Red violet', 'Violet'),
+('RAL 4003', 'Heather violet', 'Violet'),
+('RAL 4004', 'Claret violet', 'Violet'),
+('RAL 4005', 'Blue lilac', 'Violet'),
+('RAL 4006', 'Traffic purple', 'Violet'),
+('RAL 4007', 'Purple violet', 'Violet'),
+('RAL 4008', 'Signal violet', 'Violet'),
+('RAL 4009', 'Pastel violet', 'Violet'),
+('RAL 4010', 'Telemagenta', 'Violet'),
+('RAL 4011', 'Pearl violet', 'Violet'),
+('RAL 4012', 'Pearl blackberry', 'Violet'),
+('RAL 5000', 'Violet blue', 'Blue'),
+('RAL 5001', 'Green blue', 'Blue'),
+('RAL 5002', 'Ultramarine blue', 'Blue'),
+('RAL 5003', 'Sapphire blue', 'Blue'),
+('RAL 5004', 'Black blue', 'Blue'),
+('RAL 5005', 'Signal blue', 'Blue'),
+('RAL 5007', 'Brilliant blue', 'Blue'),
+('RAL 5008', 'Grey blue', 'Blue'),
+('RAL 5009', 'Azure blue', 'Blue'),
+('RAL 5010', 'Gentian blue', 'Blue'),
+('RAL 5011', 'Steel blue', 'Blue'),
+('RAL 5012', 'Light blue', 'Blue'),
+('RAL 5013', 'Cobalt blue', 'Blue'),
+('RAL 5014', 'Pigeon blue', 'Blue'),
+('RAL 5015', 'Sky blue', 'Blue'),
+('RAL 5017', 'Traffic blue', 'Blue'),
+('RAL 5018', 'Turquoise blue', 'Blue'),
+('RAL 5019', 'Capri blue', 'Blue'),
+('RAL 5020', 'Ocean blue', 'Blue'),
+('RAL 5021', 'Water blue', 'Blue'),
+('RAL 5022', 'Night blue', 'Blue'),
+('RAL 5023', 'Distant blue', 'Blue'),
+('RAL 5024', 'Pastel blue', 'Blue'),
+('RAL 5025', 'Pearl gentian', 'Blue'),
+('RAL 5026', 'Pearl night blue', 'Blue'),
+('RAL 6000', 'Patina green', 'Green'),
+('RAL 6001', 'Emerald green', 'Green'),
+('RAL 6002', 'Leaf green', 'Green'),
+('RAL 6003', 'Olive green', 'Green'),
+('RAL 6004', 'Blue green', 'Green'),
+('RAL 6005', 'Moss green', 'Green'),
+('RAL 6006', 'Grey olive', 'Green'),
+('RAL 6007', 'Bottle green', 'Green'),
+('RAL 6008', 'Brown green', 'Green'),
+('RAL 6009', 'Fir green', 'Green'),
+('RAL 6010', 'Grass green', 'Green'),
+('RAL 6011', 'Reseda green', 'Green'),
+('RAL 6012', 'Black green', 'Green'),
+('RAL 6013', 'Reed green', 'Green'),
+('RAL 6014', 'Yellow olive', 'Green'),
+('RAL 6015', 'Black olive', 'Green'),
+('RAL 6016', 'Turquoise green', 'Green'),
+('RAL 6017', 'May green', 'Green'),
+('RAL 6018', 'Yellow green', 'Green'),
+('RAL 6019', 'Pastel green', 'Green'),
+('RAL 6020', 'Chromium green', 'Green'),
+('RAL 6021', 'Pale green', 'Green'),
+('RAL 6022', 'Brown olive', 'Green'),
+('RAL 6024', 'Traffic green', 'Green'),
+('RAL 6025', 'Fern green', 'Green'),
+('RAL 6026', 'Opal green', 'Green'),
+('RAL 6027', 'Light green', 'Green'),
+('RAL 6028', 'Pine green', 'Green'),
+('RAL 6029', 'Mint green', 'Green'),
+('RAL 6031', 'Bronze green', 'Green'),
+('RAL 6032', 'Signal green', 'Green'),
+('RAL 6033', 'Mint turquoise', 'Green'),
+('RAL 6034', 'Pastel turquoise', 'Green'),
+('RAL 6035', 'Pearl green', 'Green'),
+('RAL 6036', 'Pearl opal green', 'Green'),
+('RAL 6037', 'Pure green', 'Green'),
+('RAL 6038', 'Luminous green', 'Green'),
+('RAL 6039', 'Fibrous green', 'Green'),
+('RAL 7000', 'Squirrel grey', 'Grey'),
+('RAL 7001', 'Silver grey', 'Grey'),
+('RAL 7002', 'Olive grey', 'Grey'),
+('RAL 7003', 'Moss grey', 'Grey'),
+('RAL 7004', 'Signal grey', 'Grey'),
+('RAL 7005', 'Mouse grey', 'Grey'),
+('RAL 7006', 'Beige grey', 'Grey'),
+('RAL 7008', 'Khaki grey', 'Grey'),
+('RAL 7009', 'Green grey', 'Grey'),
+('RAL 7010', 'Tarpaulin grey', 'Grey'),
+('RAL 7011', 'Iron grey', 'Grey'),
+('RAL 7012', 'Basalt grey', 'Grey'),
+('RAL 7013', 'Brown grey or NATO olive', 'Grey'),
+('RAL 7015', 'Slate grey', 'Grey'),
+('RAL 7016', 'Anthracite grey', 'Grey'),
+('RAL 7021', 'Black grey', 'Grey'),
+('RAL 7022', 'Umbra grey', 'Grey'),
+('RAL 7023', 'Concrete grey', 'Grey'),
+('RAL 7024', 'Graphite grey', 'Grey'),
+('RAL 7026', 'Granite grey', 'Grey'),
+('RAL 7030', 'Stone grey', 'Grey'),
+('RAL 7031', 'Blue grey', 'Grey'),
+('RAL 7032', 'Pebble grey', 'Grey'),
+('RAL 7033', 'Cement grey', 'Grey'),
+('RAL 7034', 'Yellow grey', 'Grey'),
+('RAL 7035', 'Light grey', 'Grey'),
+('RAL 7036', 'Platinum grey', 'Grey'),
+('RAL 7037', 'Dusty grey', 'Grey'),
+('RAL 7038', 'Agate grey', 'Grey'),
+('RAL 7039', 'Quartz grey', 'Grey'),
+('RAL 7040', 'Window grey', 'Grey'),
+('RAL 7042', 'Traffic grey A', 'Grey'),
+('RAL 7043', 'Traffic grey B', 'Grey'),
+('RAL 7044', 'Silk grey', 'Grey'),
+('RAL 7045', 'Telegrey 1', 'Grey'),
+('RAL 7046', 'Telegrey 2', 'Grey'),
+('RAL 7047', 'Telegrey 4', 'Grey'),
+('RAL 7048', 'Pearl mouse grey', 'Grey'),
+('RAL 8000', 'Green brown', 'Brown'),
+('RAL 8001', 'Ochre brown', 'Brown'),
+('RAL 8002', 'Signal brown', 'Brown'),
+('RAL 8003', 'Clay brown', 'Brown'),
+('RAL 8004', 'Copper brown', 'Brown'),
+('RAL 8007', 'Fawn brown', 'Brown'),
+('RAL 8008', 'Olive brown', 'Brown'),
+('RAL 8011', 'Nut brown', 'Brown'),
+('RAL 8012', 'Red brown', 'Brown'),
+('RAL 8014', 'Sepia brown', 'Brown'),
+('RAL 8015', 'Chestnut brown', 'Brown'),
+('RAL 8016', 'Mahogany brown', 'Brown'),
+('RAL 8017', 'Chocolate brown', 'Brown'),
+('RAL 8019', 'Grey brown', 'Brown'),
+('RAL 8022', 'Black brown', 'Brown'),
+('RAL 8023', 'Orange brown', 'Brown'),
+('RAL 8024', 'Beige brown', 'Brown'),
+('RAL 8025', 'Pale brown', 'Brown'),
+('RAL 8028', 'Terra brown', 'Brown'),
+('RAL 8029', 'Pearl copper', 'Brown'),
+('RAL 9001', 'Cream', 'White and black'),
+('RAL 9002', 'Grey white', 'White and black'),
+('RAL 9003', 'Signal white', 'White and black'),
+('RAL 9004', 'Signal black', 'White and black'),
+('RAL 9005', 'Jet black', 'White and black'),
+('RAL 9006', 'White aluminium', 'White and black'),
+('RAL 9007', 'Grey aluminium', 'White and black'),
+('RAL 9010', 'Pure white', 'White and black'),
+('RAL 9011', 'Graphite black', 'White and black'),
+('RAL 9012', 'Clean room white', 'White and black'),
+('RAL 9016', 'Traffic white', 'White and black'),
+('RAL 9017', 'Traffic black', 'White and black'),
+('RAL 9018', 'Papyrus white', 'White and black'),
+('RAL 9022', 'Pearl light grey', 'White and black'),
+('RAL 9023', 'Pearl dark grey', 'White and black')
+on conflict (ral_number) do nothing;
+
