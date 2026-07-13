@@ -94,13 +94,20 @@ def _stage_of(detail, stage_key):
     return next(s for s in detail["stages"] if s["key"] == stage_key)
 
 
-def _valid_fields(detail, stage_key, **overrides):
-    """Build a passing field payload from the stage's own field definitions."""
+def _valid_fields(detail, stage_key, phase=None, **overrides):
+    """Build a passing field payload from the stage's own field definitions.
+
+    phase=None -> all fields (single-shot submissions); "start"/"end" filter
+    to the capture phase (two-step flow).
+    """
     stage = _stage_of(detail, stage_key)
     vals = {}
-    for f in stage["fields"]:
+    defs = [f for f in stage["fields"] if phase is None or f.get("phase", "end") == phase]
+    for f in defs:
         t, k, opts = f["type"], f["key"], f.get("options", "")
-        if t == "ok_notok":
+        if t == "time":
+            vals[k] = "08:30"
+        elif t == "ok_notok":
             vals[k] = "OK"
         elif t == "pass_fail":
             vals[k] = "PASS"
@@ -119,6 +126,10 @@ def _valid_fields(detail, stage_key, **overrides):
                 vals[k] = "JOTAMASTIC 90"
             elif opts == "colors":
                 vals[k] = "Gray"
+            elif opts == "operators":
+                vals[k] = "Mr.Kishore"       # seeded in migration 0007
+            elif opts == "operator_designations":
+                vals[k] = "Painter"
             # shades / ral are optional stubs with no options yet — skip
         elif t in ("number", "decimal"):
             rng = f.get("range")
@@ -277,12 +288,25 @@ class TestStageValidation:
         assert r.status_code == 200
         assert r.json()["result"] == "fail"
 
-    def test_missing_required_field_rejected(self, auth, spec):
+    def test_missing_required_end_field_rejected(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
         detail = _detail(auth, wo["work_order_id"])
         fields = _valid_fields(detail, "primer_coat")
-        del fields["operator_name"]
+        del fields["wft_um"]  # end-phase required
         r = _submit(auth, wo["work_order_id"], "primer_coat", fields)
+        assert r.status_code == 400
+        assert "wft_um" in r.json()["detail"]
+
+    def test_missing_required_start_field_rejected_at_start(self, auth, spec):
+        # operator/paint identification is enforced when the stage STARTS
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        start_fields = _valid_fields(detail, "primer_coat", phase="start")
+        del start_fields["operator_name"]
+        r = requests.post(
+            f"{API}/work-orders/{wo['work_order_id']}/stages/primer_coat/start",
+            json={"readings": _readings()["start"], "fields": start_fields},
+            headers=auth, timeout=15)
         assert r.status_code == 400
         assert "operator_name" in r.json()["detail"]
 
@@ -339,25 +363,39 @@ class TestStageValidation:
         assert blocked.status_code == 422
         assert blocked.json()["detail"]["hard_block"] is True
 
-    def test_curing_qa_requires_batch_expiry_per_case(self, auth, spec):
-        # only_primer: primer batch/expiry required, no top keys
+    def test_curing_qa_requires_batch_expiry_at_start_per_case(self, auth, spec):
+        # batch/expiry live on curing_qa's START phase (captured before work)
         wo = _create_wo(auth, spec, "only_primer")
         detail = _detail(auth, wo["work_order_id"])
-        keys = {f["key"] for f in _stage_of(detail, "curing_qa")["fields"]}
+        start_defs = [f for f in _stage_of(detail, "curing_qa")["fields"] if f.get("phase") == "start"]
+        keys = {f["key"] for f in start_defs}
         assert {"batch_number_primer", "expiry_date_primer"} <= keys
         assert "batch_number_top" not in keys
-        r = _submit(auth, wo["work_order_id"], "curing_qa", {"mek_test": "PASS", "curing_room_temp": "OK"})
+        r = requests.post(
+            f"{API}/work-orders/{wo['work_order_id']}/stages/curing_qa/start",
+            json={"readings": _readings()["start"], "fields": {}}, headers=auth, timeout=15)
         assert r.status_code == 400
         assert "batch_number_primer" in r.json()["detail"]
-        # top_coat_only: top batch/expiry required, no primer keys
+        # top_coat_only: top batch/expiry required, no primer keys; full two-step passes
         wo2 = _create_wo(auth, spec, "top_coat_only")
         detail2 = _detail(auth, wo2["work_order_id"])
-        keys2 = {f["key"] for f in _stage_of(detail2, "curing_qa")["fields"]}
+        keys2 = {f["key"] for f in _stage_of(detail2, "curing_qa")["fields"] if f.get("phase") == "start"}
         assert {"batch_number_top", "expiry_date_top"} <= keys2
         assert "batch_number_primer" not in keys2
-        ok = _submit(auth, wo2["work_order_id"], "curing_qa", _valid_fields(detail2, "curing_qa"))
+        r2 = requests.post(
+            f"{API}/work-orders/{wo2['work_order_id']}/stages/curing_qa/start",
+            json={"readings": _readings()["start"],
+                  "fields": _valid_fields(detail2, "curing_qa", phase="start")},
+            headers=auth, timeout=15)
+        assert r2.status_code == 200, r2.text
+        ok = _submit(auth, wo2["work_order_id"], "curing_qa",
+                     _valid_fields(detail2, "curing_qa", phase="end"))
         assert ok.status_code == 200, ok.text
         assert ok.json()["result"] == "pass"
+        # merged record contains both phases
+        stg = _stage_of(_detail(auth, wo2["work_order_id"]), "curing_qa")
+        assert stg["submission"]["fields"].get("batch_number_top")
+        assert stg["submission"]["fields"].get("mek_test") == "PASS"
 
     def test_curing_qa_mek_fail_marks_fail(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
@@ -367,14 +405,15 @@ class TestStageValidation:
         assert r.status_code == 200
         assert r.json()["result"] == "fail"
 
-    def test_curing_qa_bad_expiry_date_fails(self, auth, spec):
+    def test_curing_qa_bad_expiry_date_blocked_at_start(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
         detail = _detail(auth, wo["work_order_id"])
-        r = _submit(auth, wo["work_order_id"], "curing_qa",
-                    _valid_fields(detail, "curing_qa", expiry_date_primer="15-03-2027"))
-        assert r.status_code == 200
-        assert r.json()["result"] == "fail"
-        assert any("invalid date" in e for e in r.json()["errors"])
+        bad = _valid_fields(detail, "curing_qa", phase="start", expiry_date_primer="15-03-2027")
+        r = requests.post(
+            f"{API}/work-orders/{wo['work_order_id']}/stages/curing_qa/start",
+            json={"readings": _readings()["start"], "fields": bad}, headers=auth, timeout=15)
+        assert r.status_code == 422
+        assert any("invalid date" in e for e in r.json()["detail"]["errors"])
 
     def test_stage_not_in_case_404(self, auth, spec):
         wo = _create_wo(auth, spec, "top_coat_only")  # has no primer_coat
@@ -425,8 +464,13 @@ class TestTwoStepFlow:
     def test_start_then_submit(self, auth, spec):
         wo = _create_wo(auth, spec, "primer_intermediate")
         wo_id = wo["work_order_id"]
-        start_body = {"readings": {"ambient_temp_c": 21.5, "relative_humidity_pct": 44.0,
-                                   "dew_point_c": 9.0, "surface_temp_c": 17.5}}
+        detail = _detail(auth, wo_id)
+        start_body = {
+            "readings": {"ambient_temp_c": 21.5, "relative_humidity_pct": 44.0,
+                         "dew_point_c": 9.0, "surface_temp_c": 17.5},
+            "fields": _valid_fields(detail, "primer_coat", phase="start"),
+            "photos": ["data:image/svg+xml;utf8,before-photo"],
+        }
         r = requests.post(f"{API}/work-orders/{wo_id}/stages/primer_coat/start",
                           json=start_body, headers=auth, timeout=15)
         assert r.status_code == 200, r.text
@@ -441,11 +485,13 @@ class TestTwoStepFlow:
         stg = next(s for s in detail["stages"] if s["key"] == "primer_coat")
         assert stg["status"] == "in_progress"
         assert stg["start_readings"]["surface_temp_c"] == 17.5
+        assert stg["start_fields"]["operator_name"]
+        assert len(stg["start_photos"]) == 1
 
         submit_body = {
             "readings": {"end": {"ambient_temp_c": 22.0, "relative_humidity_pct": 45.0,
                                  "dew_point_c": 9.5, "surface_temp_c": 18.0}},
-            "fields": _valid_fields(detail, "primer_coat"),
+            "fields": _valid_fields(detail, "primer_coat", phase="end"),
             "notes": "TEST two-step", "photos": [], "result": "pass",
         }
         r3 = requests.post(f"{API}/work-orders/{wo_id}/stages/primer_coat/submit",
@@ -463,6 +509,48 @@ class TestTwoStepFlow:
         r = requests.post(f"{API}/work-orders/{wo['work_order_id']}/stages/top_coat/start",
                           json={"readings": {}}, headers=auth, timeout=15)
         assert r.status_code == 404
+
+
+# ---------- Reports & distribution ----------
+class TestReports:
+    def test_generate_xlsx_and_pdf(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        _submit(auth, wo["work_order_id"], "surface_prep", _valid_fields(detail, "surface_prep"))
+        for fmt, magic in (("xlsx", b"PK"), ("pdf", b"%PDF")):
+            r = requests.get(f"{API}/work-orders/{wo['work_order_id']}/report?format={fmt}",
+                             headers=auth, timeout=30)
+            assert r.status_code == 200, r.text
+            assert r.content.startswith(magic), f"{fmt} magic bytes wrong"
+            assert wo["work_order_id"] in r.headers.get("content-disposition", "")
+
+    def test_report_includes_failure_reasons(self, auth, spec):
+        wo = _create_wo(auth, spec, "only_primer")
+        detail = _detail(auth, wo["work_order_id"])
+        _submit(auth, wo["work_order_id"], "surface_prep",
+                _valid_fields(detail, "surface_prep", oil_water_test="NOT_OK"))
+        r = requests.get(f"{API}/work-orders/{wo['work_order_id']}/report?format=xlsx",
+                         headers=auth, timeout=30)
+        assert r.status_code == 200
+        # openpyxl re-read to confirm the reason text landed in the sheet
+        import io
+        from openpyxl import load_workbook
+        ws = load_workbook(io.BytesIO(r.content)).active
+        text = " ".join(str(c.value) for row in ws.iter_rows() for c in row if c.value)
+        assert "Oil/Water" in text and "NOT OK" in text
+
+    def test_recipients_crud_and_send_guard(self, auth):
+        r = requests.post(f"{API}/report-recipients",
+                          json={"name": "QA Lead", "email": "qa.lead@example.com"},
+                          headers=auth, timeout=15)
+        assert r.status_code == 201
+        listed = requests.get(f"{API}/report-recipients", headers=auth, timeout=15).json()
+        assert any(x["email"] == "qa.lead@example.com" for x in listed)
+        # sending without GMAIL_* env must 503, not crash (test stack has none)
+        r2 = requests.post(f"{API}/work-orders/WO-0000-0000/report/send",
+                           json={"recipients": ["qa.lead@example.com"], "formats": ["pdf"]},
+                           headers=auth, timeout=15)
+        assert r2.status_code == 503
 
 
 # ---------- Weather / dashboard / audit / history ----------

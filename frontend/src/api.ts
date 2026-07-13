@@ -57,10 +57,10 @@ export const api = {
     return request<WorkOrderSummary[]>(`/work-orders${qs.toString() ? `?${qs}` : ""}`);
   },
   workOrder: (id: string) => request<WorkOrderDetail>(`/work-orders/${id}`),
-  startStage: (woId: string, stageKey: string, readings: any) =>
+  startStage: (woId: string, stageKey: string, readings: any, fields: any = {}, photos: string[] = []) =>
     request<{ ok: boolean; started_at: string }>(`/work-orders/${woId}/stages/${stageKey}/start`, {
       method: "POST",
-      body: JSON.stringify({ readings }),
+      body: JSON.stringify({ readings, fields, photos }),
     }),
   submitStage: (woId: string, stageKey: string, body: any) =>
     request<any>(`/work-orders/${woId}/stages/${stageKey}/submit`, {
@@ -168,13 +168,16 @@ export type DftWindow = "primer" | "mid_cumulative" | "top" | "total";
 export type FieldDef = {
   key: string;
   label: string;
-  type: "dropdown" | "ok_notok" | "pass_fail" | "number" | "decimal" | "text" | "date" | "note";
+  type: "dropdown" | "ok_notok" | "pass_fail" | "number" | "decimal" | "text" | "date" | "note" | "time";
+  // when the value is captured: at stage start (paint identification) or at
+  // final submission (results). Missing = "end".
+  phase?: "start" | "end";
   unit?: string;
   required?: boolean;
   fail_on?: string;
   range?: "anchor_profile" | "dft_window" | "wft" | "pct";
   hard_block_max?: boolean;
-  options?: string;      // brands | products.<coat> | colors | shades | ral
+  options?: string;      // brands | products.<coat> | colors | shades | ral | operators | operator_designations
   depends_on?: string;   // key of the field that filters this dropdown
 };
 
@@ -183,7 +186,9 @@ export type PaintOptions = {
   products: Record<string, { primer: string[]; intermediate: string[]; top: string[] }>;
   colors: string[];
   shades: Record<string, string[]>; // keyed "BRAND::PRODUCT"
-  ral: string[];                    // stub, unpopulated
+  ral: string[];                    // "RAL 3001 · Signal red" (RAL Classic)
+  operators: { name: string; designation: string }[];
+  operator_designations: string[];
 };
 
 export type Stage = {
@@ -203,6 +208,8 @@ export type Stage = {
   params: string[];
   dft_window: DftWindow | null;
   fields: FieldDef[];
+  start_fields: Record<string, string | number>;
+  start_photos: string[];
 };
 
 // DFT windows (µm) per coat stage, from the paint-system spec.

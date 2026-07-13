@@ -78,6 +78,8 @@ function resolveOptions(def: FieldDef, opts: PaintOptions | null, values: Record
   if (def.options === "brands") return opts.brands;
   if (def.options === "colors") return opts.colors;
   if (def.options === "ral") return opts.ral;
+  if (def.options === "operators") return opts.operators.map((o) => o.name);
+  if (def.options === "operator_designations") return opts.operator_designations;
   if (def.options?.startsWith("products.")) {
     const coat = def.options.split(".")[1] as "primer" | "intermediate" | "top";
     const brand = def.depends_on ? values[def.depends_on] : "";
@@ -127,6 +129,10 @@ export default function StageFormScreen() {
 
   const stageMeta = wo?.stages.find((s) => s.key === stageKey);
   const fieldDefs = useMemo(() => stageMeta?.fields ?? [], [stageMeta]);
+  // capture timing: start-phase fields (paint identification / operator /
+  // batch+expiry) are filled before work begins; end-phase fields at submission
+  const startDefs = useMemo(() => fieldDefs.filter((f) => f.phase === "start"), [fieldDefs]);
+  const endDefs = useMemo(() => fieldDefs.filter((f) => (f.phase ?? "end") === "end"), [fieldDefs]);
   const hasDropdowns = fieldDefs.some((f) => f.type === "dropdown");
 
   useEffect(() => {
@@ -167,13 +173,15 @@ export default function StageFormScreen() {
   const setValue = (key: string, v: string) => setValues((s) => ({ ...s, [key]: v }));
 
   // Per-field issue (range check mirror); hard_block_max escalates over-max.
+  // Derived ranges may need start-phase values (WFT <- % solids recorded at start).
   const fieldIssue = useCallback(
     (def: FieldDef): { msg: string; hardBlock: boolean } | null => {
       if (!wo || !stageMeta) return null;
       if (def.type !== "number" && def.type !== "decimal") return null;
       const v = n(values[def.key] ?? "");
       if (v == null) return null;
-      const range = fieldRange(wo, stageMeta, def, values);
+      const ctx = { ...Object.fromEntries(Object.entries(stageMeta.start_fields ?? {}).map(([k, val]) => [k, String(val)])), ...values };
+      const range = fieldRange(wo, stageMeta, def, ctx);
       if (!range) return null;
       const [lo, hi] = range;
       if (v > hi) return { msg: `Exceeds max ${hi}${def.unit ? ` ${def.unit}` : ""}`, hardBlock: !!def.hard_block_max };
@@ -183,11 +191,12 @@ export default function StageFormScreen() {
     [wo, stageMeta, values],
   );
 
-  const anyHardBlock = fieldDefs.some((d) => fieldIssue(d)?.hardBlock);
+  const activeDefs = phase === "start" ? startDefs : endDefs;
+  const anyHardBlock = activeDefs.some((d) => fieldIssue(d)?.hardBlock);
   const readingsFilled = !!(readings.surface_temp_c && readings.dew_point_c);
-  const requiredFilled = fieldDefs.every((d) => !d.required || !!(values[d.key] ?? "").trim());
+  const requiredFilled = activeDefs.every((d) => !d.required || !!(values[d.key] ?? "").trim());
 
-  const canStart = readingsFilled && gate.ok && !submitting;
+  const canStart = readingsFilled && gate.ok && requiredFilled && !submitting;
   const canSubmit = readingsFilled && requiredFilled && !anyHardBlock && !submitting;
 
   const addPhoto = () => {
@@ -211,11 +220,18 @@ export default function StageFormScreen() {
     setServerError(null);
     setSubmitting(true);
     try {
-      await api.startStage(wo.work_order_id, stageKey, numericReadings());
+      const startValues: Record<string, string | number> = {};
+      for (const def of startDefs) {
+        const raw = (values[def.key] ?? "").trim();
+        if (!raw) continue;
+        startValues[def.key] = def.type === "number" || def.type === "decimal" ? Number(raw) : raw;
+      }
+      await api.startStage(wo.work_order_id, stageKey, numericReadings(), startValues, photos);
       setReadings(emptyR); // form now collects END readings
+      setPhotos([]);       // and after-work photos
       await load();
     } catch (e: any) {
-      setServerError(e?.body?.detail?.errors?.join("\n") || e?.message || "Failed to record start of stage");
+      setServerError(e?.body?.detail?.errors?.join("\n") || e?.body?.detail || e?.message || "Failed to record start of stage");
     } finally {
       setSubmitting(false);
     }
@@ -227,14 +243,14 @@ export default function StageFormScreen() {
     setSubmitting(true);
     try {
       const fields: Record<string, string | number> = {};
-      for (const def of fieldDefs) {
+      for (const def of endDefs) {
         const raw = (values[def.key] ?? "").trim();
         if (!raw) continue;
         fields[def.key] = def.type === "number" || def.type === "decimal" ? Number(raw) : raw;
       }
-      const failByField = fieldDefs.some(
+      const failByField = endDefs.some(
         (d) => d.fail_on && values[d.key] === d.fail_on,
-      ) || fieldDefs.some((d) => fieldIssue(d) !== null);
+      ) || endDefs.some((d) => fieldIssue(d) !== null);
       const body = {
         readings: { end: numericReadings() },
         fields,
@@ -339,7 +355,7 @@ export default function StageFormScreen() {
             value={val}
             onChangeText={(v) => setValue(def.key, v)}
             keyboardType={def.type === "number" || def.type === "decimal" ? "decimal-pad" : "default"}
-            placeholder={def.type === "date" ? "YYYY-MM-DD" : def.type === "number" || def.type === "decimal" ? "0.00" : ""}
+            placeholder={def.type === "date" ? "YYYY-MM-DD" : def.type === "time" ? "HH:MM" : def.type === "number" || def.type === "decimal" ? "0.00" : ""}
             placeholderTextColor={colors.textMuted}
             style={[styles.input, issue && styles.inputError]}
           />
@@ -410,11 +426,24 @@ export default function StageFormScreen() {
 
             {phase === "end" && stageMeta?.start_readings ? (
               <Card style={{ marginBottom: spacing.md }}>
-                <Label>Start readings (recorded)</Label>
+                <Label>Start of stage (recorded)</Label>
                 <Text style={[type.mono, { marginTop: 4 }]}>
                   Air {stageMeta.start_readings.ambient_temp_c ?? "—"}°C · RH {stageMeta.start_readings.relative_humidity_pct ?? "—"}% ·
                   Dew {stageMeta.start_readings.dew_point_c ?? "—"}°C · Surface {stageMeta.start_readings.surface_temp_c ?? "—"}°C
                 </Text>
+                {Object.keys(stageMeta.start_fields ?? {}).length > 0 ? (
+                  <Text style={[type.bodySm, { marginTop: 6 }]}>
+                    {startDefs
+                      .filter((d) => stageMeta.start_fields?.[d.key] != null)
+                      .map((d) => `${d.label}: ${stageMeta.start_fields[d.key]}`)
+                      .join("  ·  ")}
+                  </Text>
+                ) : null}
+                {(stageMeta.start_photos ?? []).length > 0 ? (
+                  <Text style={[type.caption, { marginTop: 4 }]}>
+                    {stageMeta.start_photos.length} before-work photo(s) recorded
+                  </Text>
+                ) : null}
                 <Text style={[type.caption, { marginTop: 4 }]}>
                   {stageMeta.started_at} · {stageMeta.started_by}
                 </Text>
@@ -477,50 +506,51 @@ export default function StageFormScreen() {
               </View>
             </Card>
 
-            {/* Stage fields — END phase only, from the stage's field definitions */}
-            {phase === "end" && fieldDefs.length > 0 ? (
+            {/* Stage fields for the current capture phase */}
+            {activeDefs.length > 0 ? (
               <Card style={{ marginTop: spacing.md }}>
-                <Label>{stageMeta?.name} · Inspection Fields</Label>
-                {fieldDefs.map(renderField)}
+                <Label>
+                  {stageMeta?.name} · {phase === "start" ? "Paint Identification (before work)" : "Inspection Results"}
+                </Label>
+                {activeDefs.map(renderField)}
               </Card>
             ) : null}
 
-            {/* Photos + notes only make sense on the final (end) submission */}
-            {phase === "end" ? (
-              <>
-                <Card style={{ marginTop: spacing.md }}>
-                  <Label>Evidence Photos ({photos.length}/5)</Label>
-                  <TouchableOpacity testID="capture-photo-btn" onPress={addPhoto} disabled={photos.length >= 5} style={[styles.dropzone, photos.length >= 5 && { opacity: 0.4 }]}>
-                    <Ionicons name="camera-outline" size={28} color={colors.textPrimary} />
-                    <Text style={[type.label, { marginTop: 6, color: colors.textPrimary }]}>CAPTURE PHOTO</Text>
-                  </TouchableOpacity>
-                  <View style={{ flexDirection: "row", gap: 8, marginTop: spacing.sm }}>
-                    {Array.from({ length: 5 }).map((_, i) => (
-                      <View key={i} style={styles.thumb} testID={`photo-thumb-${i}`}>
-                        {photos[i] ? (
-                          <Image source={{ uri: photos[i] }} style={{ width: "100%", height: "100%", borderRadius: radius.sharp }} />
-                        ) : (
-                          <Ionicons name="image-outline" size={18} color={colors.textMuted} />
-                        )}
-                      </View>
-                    ))}
+            {/* Photos at both capture points: before-work at start, after-work at end */}
+            <Card style={{ marginTop: spacing.md }}>
+              <Label>{phase === "start" ? "Before-Work Photos" : "Evidence Photos"} ({photos.length}/5)</Label>
+              <TouchableOpacity testID="capture-photo-btn" onPress={addPhoto} disabled={photos.length >= 5} style={[styles.dropzone, photos.length >= 5 && { opacity: 0.4 }]}>
+                <Ionicons name="camera-outline" size={28} color={colors.textPrimary} />
+                <Text style={[type.label, { marginTop: 6, color: colors.textPrimary }]}>CAPTURE PHOTO</Text>
+              </TouchableOpacity>
+              <View style={{ flexDirection: "row", gap: 8, marginTop: spacing.sm }}>
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <View key={i} style={styles.thumb} testID={`photo-thumb-${i}`}>
+                    {photos[i] ? (
+                      <Image source={{ uri: photos[i] }} style={{ width: "100%", height: "100%", borderRadius: radius.sharp }} />
+                    ) : (
+                      <Ionicons name="image-outline" size={18} color={colors.textMuted} />
+                    )}
                   </View>
-                </Card>
+                ))}
+              </View>
+            </Card>
 
-                <Card style={{ marginTop: spacing.md }}>
-                  <Label>Inspection Notes</Label>
-                  <TextInput
-                    testID="notes-input"
-                    value={notes}
-                    onChangeText={setNotes}
-                    multiline
-                    numberOfLines={4}
-                    placeholder="Observations, non-conformance details..."
-                    placeholderTextColor={colors.textMuted}
-                    style={[styles.input, { minHeight: 96, textAlignVertical: "top", marginTop: spacing.sm }]}
-                  />
-                </Card>
-              </>
+            {/* Notes only on the final (end) submission */}
+            {phase === "end" ? (
+              <Card style={{ marginTop: spacing.md }}>
+                <Label>Inspection Notes</Label>
+                <TextInput
+                  testID="notes-input"
+                  value={notes}
+                  onChangeText={setNotes}
+                  multiline
+                  numberOfLines={4}
+                  placeholder="Observations, non-conformance details..."
+                  placeholderTextColor={colors.textMuted}
+                  style={[styles.input, { minHeight: 96, textAlignVertical: "top", marginTop: spacing.sm }]}
+                />
+              </Card>
             ) : null}
 
             {serverError ? (
@@ -598,6 +628,11 @@ export default function StageFormScreen() {
                       fieldDefs.forEach((d) => {
                         if (d.depends_on === pickerFor.key) setValue(d.key, "");
                       });
+                      // picking an operator auto-fills their designation
+                      if (pickerFor.options === "operators") {
+                        const op = paintOpts?.operators.find((o) => o.name === opt);
+                        if (op) setValue("operator_designation", op.designation);
+                      }
                       setPickerFor(null);
                     }}
                     style={styles.specOption}

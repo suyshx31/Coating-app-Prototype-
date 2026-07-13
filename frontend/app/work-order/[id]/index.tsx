@@ -137,6 +137,16 @@ export default function WorkOrderDetailScreen() {
                   <Text style={[type.bodySm, { marginTop: 2 }, isSelected && { color: "#E5E7EB" }]}>
                     {s.description}
                   </Text>
+                  {/* specific failure reasons, not just a FAIL badge */}
+                  {s.status === "fail" && (s.submission?.errors ?? []).length > 0 ? (
+                    <View style={{ marginTop: 4 }} testID={`stage-fail-reasons-${s.key}`}>
+                      {(s.submission.errors as string[]).map((e, i) => (
+                        <Text key={i} style={[type.caption, { color: isSelected ? "#FECACA" : colors.errorText }]}>
+                          ✕ {e}
+                        </Text>
+                      ))}
+                    </View>
+                  ) : null}
                 </View>
                 <StatusPill status={s.status} testID={`stage-status-${s.key}`} />
               </TouchableOpacity>

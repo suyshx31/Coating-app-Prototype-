@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict YJgulE3MQTCHsi8jVLfxSo0QJKWLixW3FNB9r318LocC5nnuf5ekZzac2IQQGqs
+\restrict dD35Z7YjS4RFNB6ONhoNME9maFXKhyaIiv1dalo7Px2XzZbfri28URRIe0jf1f2
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Debian 17.10-1.pgdg13+1)
@@ -83,6 +83,22 @@ CREATE TABLE public.case_type_stage_templates (
 
 
 --
+-- Name: generated_reports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.generated_reports (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    work_order_id text NOT NULL,
+    format text NOT NULL,
+    filename text NOT NULL,
+    content bytea NOT NULL,
+    created_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT generated_reports_format_check CHECK ((format = ANY (ARRAY['pdf'::text, 'xlsx'::text])))
+);
+
+
+--
 -- Name: inspectors; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -96,7 +112,47 @@ CREATE TABLE public.inspectors (
     shift text NOT NULL,
     department text NOT NULL,
     avatar_url text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    shift_label text,
+    shift_start time without time zone,
+    shift_end time without time zone
+);
+
+
+--
+-- Name: operators; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.operators (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    designation text NOT NULL,
+    employee_code text,
+    active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: paint_products; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.paint_products (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand text NOT NULL,
+    product_name text NOT NULL,
+    coat_roles text[] DEFAULT '{}'::text[] NOT NULL
+);
+
+
+--
+-- Name: paint_shades; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.paint_shades (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    product_id uuid NOT NULL,
+    shade_name text NOT NULL
 );
 
 
@@ -156,6 +212,42 @@ CREATE TABLE public.quota (
 
 
 --
+-- Name: ral_shades; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ral_shades (
+    ral_number text NOT NULL,
+    colour_name text NOT NULL,
+    colour_family text NOT NULL
+);
+
+
+--
+-- Name: report_recipients; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.report_recipients (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    email text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: spec_company_logos; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.spec_company_logos (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    specification text NOT NULL,
+    company_name text NOT NULL,
+    logo_url text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: wo_counters; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -187,7 +279,9 @@ CREATE TABLE public.work_order_stages (
     start_readings jsonb,
     params jsonb DEFAULT '[]'::jsonb NOT NULL,
     dft_window text,
-    fields jsonb DEFAULT '[]'::jsonb NOT NULL
+    fields jsonb DEFAULT '[]'::jsonb NOT NULL,
+    start_fields jsonb DEFAULT '{}'::jsonb NOT NULL,
+    start_photos jsonb DEFAULT '[]'::jsonb NOT NULL
 );
 
 
@@ -274,6 +368,14 @@ ALTER TABLE ONLY public.case_type_stage_templates
 
 
 --
+-- Name: generated_reports generated_reports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.generated_reports
+    ADD CONSTRAINT generated_reports_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: inspectors inspectors_email_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -298,6 +400,62 @@ ALTER TABLE ONLY public.inspectors
 
 
 --
+-- Name: operators operators_employee_code_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.operators
+    ADD CONSTRAINT operators_employee_code_key UNIQUE (employee_code);
+
+
+--
+-- Name: operators operators_name_designation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.operators
+    ADD CONSTRAINT operators_name_designation_key UNIQUE (name, designation);
+
+
+--
+-- Name: operators operators_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.operators
+    ADD CONSTRAINT operators_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: paint_products paint_products_brand_product_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paint_products
+    ADD CONSTRAINT paint_products_brand_product_name_key UNIQUE (brand, product_name);
+
+
+--
+-- Name: paint_products paint_products_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paint_products
+    ADD CONSTRAINT paint_products_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: paint_shades paint_shades_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paint_shades
+    ADD CONSTRAINT paint_shades_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: paint_shades paint_shades_product_id_shade_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paint_shades
+    ADD CONSTRAINT paint_shades_product_id_shade_name_key UNIQUE (product_id, shade_name);
+
+
+--
 -- Name: paint_system_specifications paint_system_specifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -311,6 +469,46 @@ ALTER TABLE ONLY public.paint_system_specifications
 
 ALTER TABLE ONLY public.quota
     ADD CONSTRAINT quota_pkey PRIMARY KEY (date);
+
+
+--
+-- Name: ral_shades ral_shades_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ral_shades
+    ADD CONSTRAINT ral_shades_pkey PRIMARY KEY (ral_number);
+
+
+--
+-- Name: report_recipients report_recipients_email_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.report_recipients
+    ADD CONSTRAINT report_recipients_email_key UNIQUE (email);
+
+
+--
+-- Name: report_recipients report_recipients_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.report_recipients
+    ADD CONSTRAINT report_recipients_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: spec_company_logos spec_company_logos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.spec_company_logos
+    ADD CONSTRAINT spec_company_logos_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: spec_company_logos spec_company_logos_specification_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.spec_company_logos
+    ADD CONSTRAINT spec_company_logos_specification_key UNIQUE (specification);
 
 
 --
@@ -361,6 +559,13 @@ CREATE INDEX idx_audit_log_work_order ON public.audit_log USING btree (work_orde
 
 
 --
+-- Name: idx_generated_reports_wo; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_generated_reports_wo ON public.generated_reports USING btree (work_order_id);
+
+
+--
 -- Name: idx_stages_work_order; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -380,6 +585,22 @@ CREATE INDEX idx_work_orders_dup_guard ON public.work_orders USING btree (po_num
 
 ALTER TABLE ONLY public.audit_log
     ADD CONSTRAINT audit_log_actor_employee_id_fkey FOREIGN KEY (actor_employee_id) REFERENCES public.inspectors(employee_id);
+
+
+--
+-- Name: paint_products paint_products_brand_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paint_products
+    ADD CONSTRAINT paint_products_brand_fkey FOREIGN KEY (brand) REFERENCES public.approved_paint_suppliers(supplier_name);
+
+
+--
+-- Name: paint_shades paint_shades_product_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paint_shades
+    ADD CONSTRAINT paint_shades_product_id_fkey FOREIGN KEY (product_id) REFERENCES public.paint_products(id) ON DELETE CASCADE;
 
 
 --
@@ -426,5 +647,5 @@ ALTER TABLE ONLY public.work_orders
 -- PostgreSQL database dump complete
 --
 
-\unrestrict YJgulE3MQTCHsi8jVLfxSo0QJKWLixW3FNB9r318LocC5nnuf5ekZzac2IQQGqs
+\unrestrict dD35Z7YjS4RFNB6ONhoNME9maFXKhyaIiv1dalo7Px2XzZbfri28URRIe0jf1f2
 
