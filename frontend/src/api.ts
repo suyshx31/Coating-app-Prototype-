@@ -31,7 +31,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...(await authHeader()),
     ...((init.headers as Record<string, string>) || {}),
   };
-  const res = await fetch(`${BASE}/api${path}`, { ...init, headers });
+  const res = await fetch(`${BASE}/api${path}`, {
+    ...init,
+    headers,
+  });
+
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
@@ -224,8 +228,10 @@ export type CoatLimits = {
 
 export type CaseTypeInfo = {
   case_type: string;
-  stages: { key: string; order: number; name: string; description: string;
-            requires_coat_readings: boolean; params: string[]; dft_window: DftWindow | null }[];
+  stages: {
+    key: string; order: number; name: string; description: string;
+    requires_coat_readings: boolean; params: string[]; dft_window: DftWindow | null
+  }[];
 };
 
 export type WorkOrderDetail = WorkOrderSummary & {
