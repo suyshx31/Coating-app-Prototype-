@@ -30,26 +30,16 @@ export default function LoginScreen() {
     setLoading(true);
 
     try {
-      console.log("STEP 1");
 
       const r = await api.login(email.trim(), password);
 
-      console.log("STEP 2", r);
-
       await storage.setItem(TOKEN_KEY, r.access_token);
-      console.log("STEP 3");
-
       await storage.setItem(USER_KEY, JSON.stringify(r.user));
-      console.log("STEP 4");
-
       router.replace("/(tabs)");
-      console.log("STEP 5");
 
     } catch (e: any) {
-      console.error("LOGIN ERROR:", e);
       setError(e?.message || "Login failed");
     } finally {
-      console.log("STEP 6");
       setLoading(false);
     }
   };
@@ -117,14 +107,6 @@ export default function LoginScreen() {
                 <Text style={styles.ctaText}>SIGN IN</Text>
               )}
             </TouchableOpacity>
-
-            <View style={styles.hint}>
-              <Text style={[type.caption, { color: colors.textMuted }]}>SEED ACCOUNT</Text>
-              <Text style={[type.mono, { color: colors.textSecondary, marginTop: 4 }]}>
-                j.thompson@aerospace-precision.com
-              </Text>
-              <Text style={[type.mono, { color: colors.textSecondary }]}>Inspector@123</Text>
-            </View>
           </View>
 
           <Text style={styles.footer}>v1.0 · Plant-issued device authentication</Text>
