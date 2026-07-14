@@ -28,18 +28,31 @@ export default function LoginScreen() {
   const onSubmit = async () => {
     setError(null);
     setLoading(true);
+
     try {
+      console.log("STEP 1");
+
       const r = await api.login(email.trim(), password);
+
+      console.log("STEP 2", r);
+
       await storage.setItem(TOKEN_KEY, r.access_token);
+      console.log("STEP 3");
+
       await storage.setItem(USER_KEY, JSON.stringify(r.user));
+      console.log("STEP 4");
+
       router.replace("/(tabs)");
+      console.log("STEP 5");
+
     } catch (e: any) {
+      console.error("LOGIN ERROR:", e);
       setError(e?.message || "Login failed");
     } finally {
+      console.log("STEP 6");
       setLoading(false);
     }
   };
-
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <KeyboardAvoidingView
@@ -55,7 +68,7 @@ export default function LoginScreen() {
               <Ionicons name="shield-checkmark" size={28} color={colors.accent} />
             </View>
             <Text style={styles.brandLabel}>ISO 9001 · SECURE</Text>
-            <Text style={styles.brandTitle}>COATING PORTAL</Text>
+            <Text style={styles.brandTitle}>TechniSure S</Text>
             <Text style={styles.brandSub}>QC Inspection · Traceability</Text>
           </View>
 
