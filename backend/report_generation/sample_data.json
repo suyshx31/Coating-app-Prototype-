@@ -1,0 +1,45 @@
+{
+  "nov_po": "131923",
+  "equipment_description": "Drilling Choke Actuator;Piston;MPX-40D;ACTUATOR MPX-D DBL ACTING HYDRAULIC;Trim 2.00;3000 PSI;REFER TO CHOKE P/N;-20F to 150F",
+  "part_number": "10309693-001",
+  "job_number": "50333868",
+  "serial_no": "NA",
+  "report_date": "15/11/2025",
+  "surface_prep": {
+    "method": "SSPC SP-10 Near White Blast Cleaning",
+    "booth_temp": "79-80", "surface_temp": "79-80",
+    "nozzle_pressure": "93", "dew_point": "71-72",
+    "relative_humidity": "66-70%", "abrasive": "Aluminum Oxide",
+    "blast_profile": "2.0-2.5", "time_started": "18:10",
+    "accept": "OK", "date": "14/11/2025", "operator": "Mr. Zuber"
+  },
+  "batch_numbers": {"primer": "A400024958 / B400024951", "second": "NA", "third": "NA", "fourth": "NA"},
+  "applications": [
+    {"product": "Carbozinc 858", "color": "Grey", "date": "14/11/2025", "time": "19:15:00", "operator": "Mr. Sudarshan B"},
+    {"product": "NA", "color": "NA", "date": "NA", "time": "NA", "operator": "NA"},
+    {"product": "NA", "color": "NA", "date": "NA", "time": "NA", "operator": "NA"},
+    {"product": "NA", "color": "NA", "date": "NA", "time": "NA", "operator": "NA"}
+  ],
+  "conditions": [
+    {"booth_temp": "79-80 \u00b0F", "surface_temp": "79-80 \u00b0F", "dew_point": "71-72 \u00b0F", "relative_humidity": "66-70%"},
+    {"booth_temp": "NA", "surface_temp": "NA", "dew_point": "NA", "relative_humidity": "NA"},
+    {"booth_temp": "NA", "surface_temp": "NA", "dew_point": "NA", "relative_humidity": "NA"},
+    {"booth_temp": "NA", "surface_temp": "NA", "dew_point": "NA", "relative_humidity": "NA"}
+  ],
+  "cure_test": {"batch_no": "I251511", "accept": "OK", "date": "15/11/2025", "approver": "Mr. Pavan P"},
+  "visual_inspection": {"accept": "OK", "date": "15/11/2025", "approver": "Mr. Pavan P"},
+  "nov_paint_spec": "MVG040014, SYSTEM 3.1,White/Gray (RAL 9002)",
+  "dft": {
+    "spec": {"primer": ["3", "5"], "second": ["NA", "NA"], "third": ["2", "5"], "fourth": ["NA", "NA"]},
+    "measured": {"primer": ["3.50", "5.00"], "second": ["NA", "NA"], "third": ["", "3.30"], "fourth": ["NA", "NA"]},
+    "total_min": "3.50", "total_max": "5.00"
+  },
+  "gauges": [
+    {"name": "PosiTector 6000 FNS Probe 1076838", "cal_due": "21/11/2025"},
+    {"name": "ELCOMETER 319 Top Dew Point Meter & Surface Temp probe SD18389", "cal_due": "01/10/2026"},
+    {"name": "ELCOMETER E124-3M Profile Gauge SD25490/FA982407", "cal_due": "22/02/2026"},
+    {"name": "Hypodermic needle Pressure Gauge 0-160 psi Sr no 12", "cal_due": "01/03/2026"}
+  ],
+  "completed_by": "Pavan Patil", "completed_date": "15/11/2025",
+  "approved_by": "Ladislav Kiss", "approved_date": "15/11/2025"
+}
