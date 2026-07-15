@@ -555,9 +555,8 @@ class TestReports:
     def test_nov_generate_report(self, auth, spec):
         """NOV-template report: fill → PDF convert → store → download URL;
         recipients are remembered for autocomplete even when email can't send."""
-        import server as srv
-        if srv._find_soffice() is None:
-            pytest.skip("LibreOffice not available for PDF conversion")
+        if not os.environ.get("CLOUDCONVERT_API_KEY"):
+            pytest.skip("CLOUDCONVERT_API_KEY not set — xlsx→pdf conversion unavailable")
         wo = _create_wo(auth, spec, "only_primer")
         r = requests.post(f"{API}/work-orders/{wo['work_order_id']}/generate-report",
                           json={"recipients": ["nov.reports@example.com"]},

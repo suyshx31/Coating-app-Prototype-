@@ -19,15 +19,13 @@ Auth: JWT email/password (Entra ID deferred to real Spring Boot backend).
 """
 
 import asyncio
-import glob
 import json
 import logging
 import os
 import random
-import shutil
 import smtplib
-import subprocess
 import tempfile
+import time
 from email.message import EmailMessage
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +35,7 @@ from typing import List, Literal, Optional
 
 import asyncpg
 import jwt
+import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, APIRouter, HTTPException
 from fastapi.responses import Response
@@ -1199,38 +1198,68 @@ async def _send_email_with_attachments(subject: str, body_text: str,
         raise HTTPException(502, f"Email send failed: {e}")
 
 
-def _find_soffice() -> Optional[str]:
-    """LibreOffice binary for xlsx→pdf conversion; SOFFICE_PATH overrides."""
-    explicit = os.environ.get("SOFFICE_PATH")
-    if explicit and os.path.exists(explicit):
-        return explicit
-    found = shutil.which("soffice") or shutil.which("libreoffice")
-    if found:
-        return found
-    opt = sorted(glob.glob("/opt/libreoffice*/program/soffice"))
-    return opt[-1] if opt else None
+CLOUDCONVERT_API = "https://api.cloudconvert.com/v2"
 
 
 def _convert_xlsx_to_pdf(xlsx_path: str) -> bytes:
-    """Blocking LibreOffice headless conversion — call via run_in_executor.
+    """Blocking xlsx→pdf via the CloudConvert API — call via run_in_executor.
 
-    A throwaway UserInstallation profile lets headless conversion run even
-    while a desktop LibreOffice instance is open."""
-    soffice = _find_soffice()
-    if not soffice:
-        raise RuntimeError("LibreOffice not found — install it or set SOFFICE_PATH for PDF conversion")
-    outdir = os.path.dirname(xlsx_path)
-    with tempfile.TemporaryDirectory(prefix="lo-profile-") as profile:
-        proc = subprocess.run(
-            [soffice, "--headless", "--norestore", f"-env:UserInstallation=file://{profile}",
-             "--convert-to", "pdf", "--outdir", outdir, xlsx_path],
-            capture_output=True, timeout=180,
-        )
-    pdf_path = os.path.splitext(xlsx_path)[0] + ".pdf"
-    if proc.returncode != 0 or not os.path.exists(pdf_path):
-        raise RuntimeError(f"LibreOffice conversion failed: {proc.stderr.decode(errors='replace')[:500]}")
-    with open(pdf_path, "rb") as fh:
-        return fh.read()
+    Cloud conversion (upload → convert → export/url job) so PDF generation
+    needs no system-level application on the host (Railway can't reliably
+    install LibreOffice). The rendered layout is CloudConvert's LibreOffice
+    engine, matching the previous local-soffice output."""
+    api_key = os.environ.get("CLOUDCONVERT_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("CLOUDCONVERT_API_KEY not set — required for xlsx→pdf conversion")
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    def _fail(step: str, resp) -> RuntimeError:
+        return RuntimeError(f"CloudConvert {step} failed: HTTP {resp.status_code} {resp.text[:300]}")
+
+    try:
+        resp = requests.post(f"{CLOUDCONVERT_API}/jobs", headers=headers, timeout=30, json={
+            "tasks": {
+                "upload": {"operation": "import/upload"},
+                "convert": {"operation": "convert", "input": "upload",
+                            "input_format": "xlsx", "output_format": "pdf"},
+                "export": {"operation": "export/url", "input": "convert"},
+            },
+        })
+        if resp.status_code not in (200, 201):
+            raise _fail("job create", resp)
+        job = resp.json()["data"]
+
+        upload = next(t for t in job["tasks"] if t["name"] == "upload")
+        form = upload["result"]["form"]
+        with open(xlsx_path, "rb") as fh:
+            up = requests.post(form["url"], data=form["parameters"],
+                               files={"file": (os.path.basename(xlsx_path), fh)}, timeout=120)
+        if up.status_code not in (200, 201):
+            raise _fail("file upload", up)
+
+        deadline = time.monotonic() + 180
+        while True:
+            resp = requests.get(f"{CLOUDCONVERT_API}/jobs/{job['id']}", headers=headers, timeout=30)
+            if resp.status_code != 200:
+                raise _fail("status poll", resp)
+            job = resp.json()["data"]
+            if job["status"] == "finished":
+                break
+            if job["status"] == "error":
+                errs = "; ".join(f"{t['name']}: {t.get('message') or 'error'}"
+                                 for t in job["tasks"] if t["status"] == "error")
+                raise RuntimeError(f"CloudConvert conversion failed: {errs or 'unknown error'}")
+            if time.monotonic() > deadline:
+                raise RuntimeError("CloudConvert conversion timed out after 180s")
+            time.sleep(2)
+
+        export = next(t for t in job["tasks"] if t["name"] == "export")
+        dl = requests.get(export["result"]["files"][0]["url"], timeout=120)
+        if dl.status_code != 200 or not dl.content.startswith(b"%PDF"):
+            raise _fail("result download", dl)
+        return dl.content
+    except requests.RequestException as e:
+        raise RuntimeError(f"CloudConvert request failed: {e}")
 
 
 @api.get("/report-recipients")
