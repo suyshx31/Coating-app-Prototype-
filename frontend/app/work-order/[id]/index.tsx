@@ -1,12 +1,168 @@
-import { useCallback, useState } from "react";
-import { ScrollView, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from "react-native";
+import { useCallback, useEffect, useState } from "react";
+import {
+  ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View,
+  ActivityIndicator, Alert, Linking,
+} from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter, useFocusEffect } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
-import { api, WorkOrderDetail } from "@/src/api";
+import { api, BASE, TOKEN_KEY, GenerateReportResponse, WorkOrderDetail } from "@/src/api";
+import { storage } from "@/src/utils/storage";
 import { colors, radius, spacing, type } from "@/src/theme";
 import { Card, DataId, Label, StatusPill, Divider } from "@/src/components/UI";
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Recipient picker + "Generate & Send Report" action, shown once every stage
+ * has been submitted. Suggests previously-used recipient emails as you type
+ * (from /report-recipients); new addresses are remembered server-side. */
+function ReportCard({ workOrderId }: { workOrderId: string }) {
+  const [saved, setSaved] = useState<string[]>([]);
+  const [recipients, setRecipients] = useState<string[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<GenerateReportResponse | null>(null);
+
+  useEffect(() => {
+    api.reportRecipients().then((rows) => setSaved(rows.map((r) => r.email))).catch(() => {});
+  }, []);
+
+  const needle = input.trim().toLowerCase();
+  const suggestions = needle
+    ? saved.filter((e) => e.includes(needle) && !recipients.includes(e)).slice(0, 4)
+    : [];
+
+  const addRecipient = (email: string) => {
+    const e = email.trim().toLowerCase();
+    if (!EMAIL_RE.test(e)) {
+      Alert.alert("Invalid email", `"${email.trim()}" is not a valid email address.`);
+      return;
+    }
+    if (!recipients.includes(e)) setRecipients((prev) => [...prev, e]);
+    setInput("");
+  };
+
+  const generate = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await api.generateReport(workOrderId, recipients);
+      setResult(r);
+      // newly-used addresses are now saved server-side — refresh suggestions
+      api.reportRecipients().then((rows) => setSaved(rows.map((x) => x.email))).catch(() => {});
+      Alert.alert(
+        "Report generated",
+        r.email_sent
+          ? `PDF emailed to ${r.sent_to.join(", ")}`
+          : r.email_error
+            ? `PDF generated, but email failed: ${r.email_error}`
+            : "PDF generated (no email recipients given).",
+      );
+    } catch (e: any) {
+      Alert.alert("Report failed", e?.message || "Could not generate the report.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openPdf = async () => {
+    if (!result) return;
+    const token = (await storage.getItem<string>(TOKEN_KEY, "")) || "";
+    Linking.openURL(`${BASE}${result.download_url}?token=${encodeURIComponent(token)}`);
+  };
+
+  return (
+    <Card style={{ marginTop: spacing.lg }}>
+      <Label>Final Report</Label>
+      <Text style={[type.bodySm, { marginTop: 4 }]}>
+        Generate the NOV inspection report and email the PDF to one or more recipients.
+      </Text>
+
+      {recipients.length > 0 && (
+        <View style={reportStyles.chipRow}>
+          {recipients.map((e) => (
+            <TouchableOpacity
+              key={e}
+              testID={`recipient-chip-${e}`}
+              style={reportStyles.chip}
+              onPress={() => setRecipients((prev) => prev.filter((x) => x !== e))}
+            >
+              <Text style={reportStyles.chipText}>{e}</Text>
+              <Ionicons name="close" size={13} color={colors.textPrimary} />
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
+      <View style={reportStyles.inputRow}>
+        <TextInput
+          testID="report-recipient-input"
+          style={reportStyles.input}
+          value={input}
+          onChangeText={setInput}
+          placeholder="Recipient email…"
+          placeholderTextColor={colors.textSecondary}
+          autoCapitalize="none"
+          keyboardType="email-address"
+          onSubmitEditing={() => input.trim() && addRecipient(input)}
+        />
+        <TouchableOpacity
+          testID="report-recipient-add"
+          style={[reportStyles.addBtn, !input.trim() && { opacity: 0.4 }]}
+          disabled={!input.trim()}
+          onPress={() => addRecipient(input)}
+        >
+          <Ionicons name="add" size={18} color={colors.textInverse} />
+        </TouchableOpacity>
+      </View>
+
+      {suggestions.length > 0 && (
+        <View style={reportStyles.suggestBox}>
+          {suggestions.map((e) => (
+            <TouchableOpacity
+              key={e}
+              testID={`recipient-suggestion-${e}`}
+              style={reportStyles.suggestRow}
+              onPress={() => addRecipient(e)}
+            >
+              <Ionicons name="time-outline" size={14} color={colors.textSecondary} />
+              <Text style={type.bodySm}>{e}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
+      <TouchableOpacity
+        testID="generate-send-report"
+        style={[reportStyles.generateBtn, busy && { opacity: 0.6 }]}
+        disabled={busy}
+        onPress={generate}
+        activeOpacity={0.85}
+      >
+        {busy ? (
+          <ActivityIndicator color={colors.textInverse} size="small" />
+        ) : (
+          <Ionicons name="document-text-outline" size={16} color={colors.textInverse} />
+        )}
+        <Text style={reportStyles.generateText}>
+          {recipients.length > 0 ? "GENERATE & SEND REPORT" : "GENERATE REPORT"}
+        </Text>
+      </TouchableOpacity>
+
+      {result && (
+        <View style={reportStyles.resultBox} testID="report-result">
+          <Text style={[type.bodySm, { fontWeight: "700" }]}>
+            ✓ {result.filename} {result.email_sent ? `— emailed to ${result.sent_to.join(", ")}` : "— generated"}
+          </Text>
+          <TouchableOpacity onPress={openPdf} style={{ marginTop: 6 }} testID="view-report-pdf">
+            <Text style={[type.bodySm, { color: colors.accent, fontWeight: "800" }]}>VIEW PDF</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+    </Card>
+  );
+}
 
 export default function WorkOrderDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -163,6 +319,10 @@ export default function WorkOrderDetailScreen() {
           <Ionicons name="time-outline" size={16} color={colors.textPrimary} />
           <Text style={styles.secondaryCtaText}>VIEW AUDIT LOG</Text>
         </TouchableOpacity>
+
+        {wo.stages.every((s) => s.status === "done" || s.status === "fail") && (
+          <ReportCard workOrderId={wo.work_order_id} />
+        )}
       </ScrollView>
 
       <View style={[styles.stickyBar, { paddingBottom: spacing.md + insets.bottom }]}>
@@ -180,6 +340,20 @@ export default function WorkOrderDetailScreen() {
     </SafeAreaView>
   );
 }
+
+const reportStyles = StyleSheet.create({
+  chipRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, marginTop: spacing.md },
+  chip: { flexDirection: "row", alignItems: "center", gap: 4, paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: colors.border, borderRadius: radius.button, backgroundColor: colors.bg },
+  chipText: { ...type.bodySm, fontWeight: "700" },
+  inputRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md },
+  input: { flex: 1, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, backgroundColor: colors.bg, paddingHorizontal: 12, paddingVertical: 10, ...type.bodySm, color: colors.textPrimary },
+  addBtn: { width: 42, alignItems: "center", justifyContent: "center", backgroundColor: colors.brand, borderRadius: radius.sharp },
+  suggestBox: { marginTop: 4, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, backgroundColor: colors.bg },
+  suggestRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border },
+  generateBtn: { marginTop: spacing.md, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, backgroundColor: colors.brand, paddingVertical: 14, borderRadius: radius.button },
+  generateText: { color: colors.textInverse, fontWeight: "800", letterSpacing: 1, fontSize: 12 },
+  resultBox: { marginTop: spacing.md, padding: spacing.sm, borderWidth: 1, borderColor: colors.border, borderRadius: radius.sharp, backgroundColor: colors.bg },
+});
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },

@@ -4,7 +4,7 @@
  */
 import { storage } from "@/src/utils/storage";
 
-const BASE = process.env.EXPO_PUBLIC_BACKEND_URL!;
+export const BASE = process.env.EXPO_PUBLIC_BACKEND_URL!;
 
 export const TOKEN_KEY = "cp.jwt";
 export const USER_KEY = "cp.user";
@@ -80,6 +80,24 @@ export const api = {
   paintOptions: () => request<PaintOptions>(`/paint-options`),
   createWorkOrder: (body: CreateWorkOrderBody) =>
     request<WorkOrderSummary>(`/work-orders`, { method: "POST", body: JSON.stringify(body) }),
+  reportRecipients: () => request<ReportRecipient[]>(`/report-recipients`),
+  generateReport: (woId: string, recipients: string[], message?: string) =>
+    request<GenerateReportResponse>(`/work-orders/${woId}/generate-report`, {
+      method: "POST",
+      body: JSON.stringify({ recipients, message: message || "" }),
+    }),
+};
+
+export type ReportRecipient = { id: string; name: string; email: string };
+
+export type GenerateReportResponse = {
+  ok: boolean;
+  filename: string;
+  download_url: string;      // relative API path; append ?token=<jwt> to open in a browser
+  xlsx_download_url: string;
+  email_sent: boolean;
+  email_error: string | null; // set when generation succeeded but the email send failed
+  sent_to: string[];
 };
 
 // Row from Supabase paint_system_specifications (imported spec sheet).
