@@ -18,11 +18,16 @@ Implements the domain model from the spec:
 Auth: JWT email/password (Entra ID deferred to real Spring Boot backend).
 """
 
+import asyncio
+import glob
 import json
 import logging
 import os
 import random
+import shutil
 import smtplib
+import subprocess
+import tempfile
 from email.message import EmailMessage
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -41,6 +46,8 @@ from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 
 import reports as report_gen
+from report_generation.fill_nov_report import fill_report as fill_nov_report
+from report_generation.nov_payload import build_nov_payload
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -1150,6 +1157,81 @@ class SendReportRequest(BaseModel):
     formats: List[Literal["pdf", "xlsx"]] = Field(default_factory=lambda: ["pdf"])
     message: Optional[str] = ""
 
+class GenerateReportRequest(BaseModel):
+    # empty recipients = generate + store only, no email
+    recipients: List[EmailStr] = Field(default_factory=list)
+    message: Optional[str] = ""
+
+
+def _attachment_media(filename: str) -> tuple[str, str]:
+    return ("application", "pdf") if filename.endswith(".pdf") else \
+        ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+async def _send_email_with_attachments(subject: str, body_text: str,
+                                       recipients: List[str],
+                                       attachments: List[tuple[str, bytes]]):
+    """Send via the configured Gmail SMTP account; raises HTTPException on failure."""
+    gmail_user = os.environ.get("GMAIL_USER", "")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
+    if not gmail_user or not gmail_pass:
+        raise HTTPException(503, "Email not configured: set GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = gmail_user
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body_text)
+    for filename, content in attachments:
+        maintype, subtype = _attachment_media(filename)
+        msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
+
+    def _send():
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(gmail_user, gmail_pass)
+            smtp.send_message(msg)
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _send)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(502, "Gmail rejected the credentials (use an App Password, not the account password)")
+    except (smtplib.SMTPException, OSError) as e:
+        raise HTTPException(502, f"Email send failed: {e}")
+
+
+def _find_soffice() -> Optional[str]:
+    """LibreOffice binary for xlsx→pdf conversion; SOFFICE_PATH overrides."""
+    explicit = os.environ.get("SOFFICE_PATH")
+    if explicit and os.path.exists(explicit):
+        return explicit
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    opt = sorted(glob.glob("/opt/libreoffice*/program/soffice"))
+    return opt[-1] if opt else None
+
+
+def _convert_xlsx_to_pdf(xlsx_path: str) -> bytes:
+    """Blocking LibreOffice headless conversion — call via run_in_executor.
+
+    A throwaway UserInstallation profile lets headless conversion run even
+    while a desktop LibreOffice instance is open."""
+    soffice = _find_soffice()
+    if not soffice:
+        raise RuntimeError("LibreOffice not found — install it or set SOFFICE_PATH for PDF conversion")
+    outdir = os.path.dirname(xlsx_path)
+    with tempfile.TemporaryDirectory(prefix="lo-profile-") as profile:
+        proc = subprocess.run(
+            [soffice, "--headless", "--norestore", f"-env:UserInstallation=file://{profile}",
+             "--convert-to", "pdf", "--outdir", outdir, xlsx_path],
+            capture_output=True, timeout=180,
+        )
+    pdf_path = os.path.splitext(xlsx_path)[0] + ".pdf"
+    if proc.returncode != 0 or not os.path.exists(pdf_path):
+        raise RuntimeError(f"LibreOffice conversion failed: {proc.stderr.decode(errors='replace')[:500]}")
+    with open(pdf_path, "rb") as fh:
+        return fh.read()
+
 
 @api.get("/report-recipients")
 async def list_recipients(_=Depends(get_current_user)):
@@ -1206,42 +1288,120 @@ async def download_report(work_order_id: str, format: Literal["pdf", "xlsx"] = "
 
 @api.post("/work-orders/{work_order_id}/report/send")
 async def send_report(work_order_id: str, body: SendReportRequest, current=Depends(get_current_user)):
-    gmail_user = os.environ.get("GMAIL_USER", "")
-    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
-    if not gmail_user or not gmail_pass:
+    # config guard up front — don't build reports that can't be sent
+    if not os.environ.get("GMAIL_USER") or not os.environ.get("GMAIL_APP_PASSWORD"):
         raise HTTPException(503, "Email not configured: set GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env")
-
     assert pool is not None
     async with pool.acquire() as conn:
         attachments = [await _build_report(conn, work_order_id, fmt, current) for fmt in body.formats]
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Final Paint Report — {work_order_id}"
-    msg["From"] = gmail_user
-    msg["To"] = ", ".join(body.recipients)
-    msg.set_content(body.message or f"Please find attached the final paint report for {work_order_id}.")
-    for filename, content in attachments:
-        maintype, subtype = ("application", "pdf") if filename.endswith(".pdf") else \
-            ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
-
-    import asyncio as _asyncio
-
-    def _send():
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
-            smtp.login(gmail_user, gmail_pass)
-            smtp.send_message(msg)
-
-    try:
-        await _asyncio.get_running_loop().run_in_executor(None, _send)
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(502, "Gmail rejected the credentials (use an App Password, not the account password)")
-    except (smtplib.SMTPException, OSError) as e:
-        raise HTTPException(502, f"Email send failed: {e}")
-
+    await _send_email_with_attachments(
+        f"Final Paint Report — {work_order_id}",
+        body.message or f"Please find attached the final paint report for {work_order_id}.",
+        body.recipients, attachments,
+    )
     await write_audit(work_order_id, None, current, "report_sent",
                       f"Report ({', '.join(body.formats)}) emailed to {', '.join(body.recipients)}")
     return {"ok": True, "sent_to": body.recipients, "formats": body.formats}
+
+
+# ---- NOV template report (fill_nov_report.py + LibreOffice PDF) ----
+@api.post("/work-orders/{work_order_id}/generate-report")
+async def generate_nov_report(work_order_id: str, body: GenerateReportRequest,
+                              current=Depends(get_current_user)):
+    """Fill the NOV 2-coat IR xlsx template from the work order's captured data,
+    convert to PDF, store both, and optionally email the PDF to recipients.
+    Each new recipient email is remembered for autocomplete (report_recipients)."""
+    assert pool is not None
+    async with pool.acquire() as conn:
+        wos = await _fetch_work_orders(conn, work_order_id)
+        if not wos:
+            raise HTTPException(404, "Work order not found")
+        wo = wos[0]
+        ps = None
+        if wo.get("paint_system_id"):
+            ps = await conn.fetchrow(
+                "select * from paint_system_specifications where id = $1::uuid", wo["paint_system_id"])
+        names = {r["employee_id"]: r["name"] for r in
+                 await conn.fetch("select employee_id, name from inspectors")}
+
+        payload = build_nov_payload(wo, dict(ps) if ps else None, names, current["name"])
+        with tempfile.TemporaryDirectory(prefix="nov-report-") as tmp:
+            xlsx_path = fill_nov_report(payload, out_dir=tmp, filename=f"NOV_IR_{work_order_id}.xlsx")
+            with open(xlsx_path, "rb") as fh:
+                xlsx_bytes = fh.read()
+            try:
+                pdf_bytes = await asyncio.get_running_loop().run_in_executor(
+                    None, _convert_xlsx_to_pdf, xlsx_path)
+            except RuntimeError as e:
+                raise HTTPException(500, str(e))
+
+        pdf_name = f"NOV_IR_{work_order_id}.pdf"
+        report_ids = {}
+        for fmt, fname, content in (("xlsx", f"NOV_IR_{work_order_id}.xlsx", xlsx_bytes),
+                                    ("pdf", pdf_name, pdf_bytes)):
+            report_ids[fmt] = await conn.fetchval(
+                """insert into generated_reports (work_order_id, format, filename, content, created_by)
+                   values ($1, $2, $3, $4, $5) returning id""",
+                work_order_id, fmt, fname, content, current["employee_id"],
+            )
+
+        # remember recipients on first use (feeds the autocomplete)
+        for email in {str(e).lower() for e in body.recipients}:
+            await conn.execute(
+                "insert into report_recipients (name, email) values ('', $1) on conflict (email) do nothing",
+                email,
+            )
+
+    # email failure is non-fatal: the report is already generated and stored,
+    # so the download URLs are still returned alongside the error
+    email_sent, email_error = False, None
+    if body.recipients:
+        try:
+            await _send_email_with_attachments(
+                f"NOV Final Paint Report — {work_order_id}",
+                body.message or f"Please find attached the NOV final paint report for {work_order_id}.",
+                body.recipients, [(pdf_name, pdf_bytes)],
+            )
+            email_sent = True
+        except HTTPException as e:
+            email_error = str(e.detail)
+
+    detail = "NOV report generated (xlsx+pdf)" + \
+        (f", PDF emailed to {', '.join(body.recipients)}" if email_sent else "")
+    await write_audit(work_order_id, None, current, "nov_report_generated", detail)
+    return {
+        "ok": True,
+        "filename": pdf_name,
+        "download_url": f"/api/reports/{report_ids['pdf']}",
+        "xlsx_download_url": f"/api/reports/{report_ids['xlsx']}",
+        "email_sent": email_sent,
+        "email_error": email_error,
+        "sent_to": [str(e) for e in body.recipients] if email_sent else [],
+    }
+
+
+@api.get("/reports/{report_id}")
+async def download_generated_report(report_id: str, token: Optional[str] = None,
+                                    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)):
+    """Download a stored generated report. Accepts the JWT either as a Bearer
+    header or a ?token= query param (so mobile can open the URL in a browser)."""
+    raw = creds.credentials if creds else token
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing auth token")
+    try:
+        jwt.decode(raw, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    assert pool is not None
+    row = await pool.fetchrow(
+        "select filename, format, content from generated_reports where id::text = $1", report_id)
+    if not row:
+        raise HTTPException(404, "Report not found")
+    media = "application/pdf" if row["format"] == "pdf" else \
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return Response(content=row["content"], media_type=media,
+                    headers={"Content-Disposition": f'attachment; filename="{row["filename"]}"'})
 
 
 app.include_router(api)

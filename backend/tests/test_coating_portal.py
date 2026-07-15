@@ -552,6 +552,39 @@ class TestReports:
                            headers=auth, timeout=15)
         assert r2.status_code == 503
 
+    def test_nov_generate_report(self, auth, spec):
+        """NOV-template report: fill → PDF convert → store → download URL;
+        recipients are remembered for autocomplete even when email can't send."""
+        import server as srv
+        if srv._find_soffice() is None:
+            pytest.skip("LibreOffice not available for PDF conversion")
+        wo = _create_wo(auth, spec, "only_primer")
+        r = requests.post(f"{API}/work-orders/{wo['work_order_id']}/generate-report",
+                          json={"recipients": ["nov.reports@example.com"]},
+                          headers=auth, timeout=120)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ok"] is True
+        assert body["filename"].endswith(".pdf")
+        # no GMAIL_* env on the test stack: generation still succeeds,
+        # the email failure is reported instead of aborting
+        assert body["email_sent"] is False
+        assert "Email not configured" in (body["email_error"] or "")
+        # the recipient email was remembered on first use
+        listed = requests.get(f"{API}/report-recipients", headers=auth, timeout=15).json()
+        assert any(x["email"] == "nov.reports@example.com" for x in listed)
+        # stored PDF downloads via bearer header and via ?token= (browser flow)
+        pdf = requests.get(f"{BASE}{body['download_url']}", headers=auth, timeout=30)
+        assert pdf.status_code == 200
+        assert pdf.content[:5] == b"%PDF-"
+        tok = auth["Authorization"].split(" ", 1)[1]
+        pdf2 = requests.get(f"{BASE}{body['download_url']}?token={tok}", timeout=30)
+        assert pdf2.status_code == 200
+        assert requests.get(f"{BASE}{body['download_url']}", timeout=30).status_code == 401
+        xlsx = requests.get(f"{BASE}{body['xlsx_download_url']}", headers=auth, timeout=30)
+        assert xlsx.status_code == 200
+        assert xlsx.content[:2] == b"PK"
+
 
 # ---------- Weather / dashboard / audit / history ----------
 class TestWeather:
