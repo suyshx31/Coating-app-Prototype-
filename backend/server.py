@@ -758,6 +758,7 @@ async def paint_options(_=Depends(get_current_user)):
         "ral": ral,                    # "RAL 3001 · Signal red" (217 rows)
         "operators": operators,        # [{name, designation}]
         "operator_designations": sorted({o["designation"] for o in operators}),
+        "shifts": ["First Shift", "Second Shift"],
     }
 
 

@@ -211,6 +211,7 @@ export type PaintOptions = {
   ral: string[];                    // "RAL 3001 · Signal red" (RAL Classic)
   operators: { name: string; designation: string }[];
   operator_designations: string[];
+  shifts: string[]; // "First Shift" | "Second Shift"
 };
 
 export type Stage = {

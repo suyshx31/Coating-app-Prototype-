@@ -101,6 +101,7 @@ function resolveOptions(def: FieldDef, opts: PaintOptions | null, values: Record
   if (def.options === "ral") return opts.ral;
   if (def.options === "operators") return opts.operators.map((o) => o.name);
   if (def.options === "operator_designations") return opts.operator_designations;
+  if (def.options === "shifts") return opts.shifts;
   if (def.options?.startsWith("products.")) {
     const coat = def.options.split(".")[1] as "primer" | "intermediate" | "top";
     const brand = def.depends_on ? values[def.depends_on] : "";

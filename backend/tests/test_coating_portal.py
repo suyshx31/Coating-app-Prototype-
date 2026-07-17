@@ -133,6 +133,8 @@ def _valid_fields(detail, stage_key, phase=None, **overrides):
                 vals[k] = "Mr.Kishore"       # seeded in migration 0007
             elif opts == "operator_designations":
                 vals[k] = "Painter"
+            elif opts == "shifts":
+                vals[k] = "First Shift"
             # shades / ral are optional stubs with no options yet — skip
         elif t in ("number", "decimal"):
             rng = f.get("range")
@@ -396,6 +398,26 @@ class TestStageValidation:
             headers=auth, timeout=15)
         assert r.status_code == 400
         assert "batch_number" in r.json()["detail"]
+
+    def test_shift_required_at_start_of_every_stage(self, auth, spec):
+        # since migration 0011: "Shift" dropdown is the first field of every
+        # stage, captured at start
+        wo = _create_wo(auth, spec, "primer_intermediate_top")
+        detail = _detail(auth, wo["work_order_id"])
+        for stage in detail["stages"]:
+            first = stage["fields"][0]
+            assert first["key"] == "shift", stage["key"]
+            assert first["type"] == "dropdown" and first["options"] == "shifts"
+            assert first.get("phase") == "start" and first.get("required") is True
+        # missing shift blocks the stage from starting
+        start_fields = _valid_fields(detail, "surface_prep", phase="start")
+        del start_fields["shift"]
+        r = requests.post(
+            f"{API}/work-orders/{wo['work_order_id']}/stages/surface_prep/start",
+            json={"readings": _readings()["start"], "fields": start_fields},
+            headers=auth, timeout=15)
+        assert r.status_code == 400
+        assert "shift" in r.json()["detail"]
 
     def test_curing_qa_mek_fail_marks_fail(self, auth, spec):
         wo = _create_wo(auth, spec, "only_primer")
