@@ -54,6 +54,7 @@ const CASE_TYPE_LABELS: Record<string, string> = {
   primer_intermediate: "Primer + Intermediate",
   primer_intermediate_top: "Primer + Intermediate + Top Coat",
   top_coat_only: "Top Coat Only",
+  primer_top_coat: "Primer + Top Coat",
 };
 
 export default function NewWorkOrderScreen() {

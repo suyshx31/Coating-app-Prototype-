@@ -184,13 +184,13 @@ export type StageReadings = {
   surface_temp_c: number | null;
 };
 
-export type DftWindow = "primer" | "mid_cumulative" | "top" | "total";
+export type DftWindow = "primer" | "mid_cumulative" | "primer_top_cumulative" | "top" | "total";
 
 // Typed field descriptor snapshotted onto each stage from its case-type template.
 export type FieldDef = {
   key: string;
   label: string;
-  type: "dropdown" | "ok_notok" | "pass_fail" | "number" | "decimal" | "text" | "date" | "note" | "time";
+  type: "dropdown" | "ok_notok" | "pass_fail" | "number" | "decimal" | "text" | "date" | "date_dmy" | "note" | "time";
   // when the value is captured: at stage start (paint identification) or at
   // final submission (results). Missing = "end".
   phase?: "start" | "end";
@@ -241,6 +241,7 @@ export type CoatLimits = {
   intermediate: [number, number] | null;
   top: [number, number] | null;
   mid_cumulative: [number, number] | null;
+  primer_top_cumulative: [number, number] | null;
   total: [number, number] | null;
 };
 

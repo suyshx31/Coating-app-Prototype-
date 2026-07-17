@@ -41,6 +41,27 @@ function n(s: string): number | null {
   return Number.isFinite(v) ? v : null;
 }
 
+// DD/MM/YYYY input mask: digits only, "/" inserted automatically after DD and MM.
+function maskDmy(v: string): string {
+  const d = v.replace(/\D/g, "").slice(0, 8);
+  if (d.length <= 2) return d;
+  if (d.length <= 4) return `${d.slice(0, 2)}/${d.slice(2)}`;
+  return `${d.slice(0, 2)}/${d.slice(2, 4)}/${d.slice(4)}`;
+}
+
+// null = valid complete DD/MM/YYYY date; otherwise the reason it isn't.
+function dmyIssue(v: string): string | null {
+  if (!/^\d{2}\/\d{2}\/\d{4}$/.test(v)) return "Enter full date as DD/MM/YYYY";
+  const [dd, mm, yyyy] = v.split("/").map(Number);
+  if (mm < 1 || mm > 12) return "Month must be 01–12";
+  if (dd < 1 || dd > 31) return "Day must be 01–31";
+  const dt = new Date(yyyy, mm - 1, dd);
+  if (dt.getFullYear() !== yyyy || dt.getMonth() !== mm - 1 || dt.getDate() !== dd) {
+    return `${v} is not a valid calendar date`;
+  }
+  return null;
+}
+
 // DFT window for this stage per its dft_window snapshot; falls back to the
 // WO's total spec range if the paint system lacks that window.
 function dftWindow(wo: WorkOrderDetail, stage: Stage): [number, number] {
@@ -195,9 +216,16 @@ export default function StageFormScreen() {
   const anyHardBlock = activeDefs.some((d) => fieldIssue(d)?.hardBlock);
   const readingsFilled = !!(readings.surface_temp_c && readings.dew_point_c);
   const requiredFilled = activeDefs.every((d) => !d.required || !!(values[d.key] ?? "").trim());
+  // a typed-but-incomplete/invalid DD/MM/YYYY date blocks progression
+  const dmyOk = activeDefs.every(
+    (d) => d.type !== "date_dmy" || !(values[d.key] ?? "").trim() || dmyIssue(values[d.key]) === null,
+  );
+  // Curing + QA takes no environmental/surface-temp readings; the snapshot's
+  // requires_coat_readings flag says whether this stage captures them at all
+  const needsReadings = !!stageMeta?.requires_coat_readings;
 
-  const canStart = readingsFilled && gate.ok && requiredFilled && !submitting;
-  const canSubmit = readingsFilled && requiredFilled && !anyHardBlock && !submitting;
+  const canStart = (!needsReadings || (readingsFilled && gate.ok)) && requiredFilled && dmyOk && !submitting;
+  const canSubmit = (!needsReadings || readingsFilled) && requiredFilled && dmyOk && !anyHardBlock && !submitting;
 
   const addPhoto = () => {
     if (photos.length >= 5) return;
@@ -256,7 +284,7 @@ export default function StageFormScreen() {
         fields,
         notes,
         photos,
-        result: gate.ok && !failByField ? "pass" : "fail",
+        result: (!needsReadings || gate.ok) && !failByField ? "pass" : "fail",
       };
       const r = await api.submitStage(wo.work_order_id, stageKey, body);
       router.replace(`/work-order/${wo.work_order_id}/submitted?stage=${stageKey}&result=${r.result}`);
@@ -349,6 +377,31 @@ export default function StageFormScreen() {
             placeholderTextColor={colors.textMuted}
             style={[styles.input, { minHeight: 72, textAlignVertical: "top" }]}
           />
+        ) : def.type === "date_dmy" ? (
+          (() => {
+            // masked date input: digits only, "/" auto-inserted (DD/MM/YYYY)
+            const err = val.trim() ? dmyIssue(val) : null;
+            return (
+              <>
+                <TextInput
+                  testID={`field-${def.key}-input`}
+                  value={val}
+                  onChangeText={(v) => setValue(def.key, maskDmy(v))}
+                  keyboardType="number-pad"
+                  maxLength={10}
+                  placeholder="DD/MM/YYYY"
+                  placeholderTextColor={colors.textMuted}
+                  style={[styles.input, err && styles.inputError]}
+                />
+                {err ? (
+                  <View style={styles.hardBlock}>
+                    <Ionicons name="warning-outline" size={14} color={colors.warningText} />
+                    <Text style={[styles.inlineErr, { color: colors.warningText }]}>{err}</Text>
+                  </View>
+                ) : null}
+              </>
+            );
+          })()
         ) : (
           <TextInput
             testID={`field-${def.key}-input`}
@@ -427,10 +480,12 @@ export default function StageFormScreen() {
             {phase === "end" && stageMeta?.start_readings ? (
               <Card style={{ marginBottom: spacing.md }}>
                 <Label>Start of stage (recorded)</Label>
-                <Text style={[type.mono, { marginTop: 4 }]}>
-                  Air {stageMeta.start_readings.ambient_temp_c ?? "—"}°C · RH {stageMeta.start_readings.relative_humidity_pct ?? "—"}% ·
-                  Dew {stageMeta.start_readings.dew_point_c ?? "—"}°C · Surface {stageMeta.start_readings.surface_temp_c ?? "—"}°C
-                </Text>
+                {needsReadings ? (
+                  <Text style={[type.mono, { marginTop: 4 }]}>
+                    Air {stageMeta.start_readings.ambient_temp_c ?? "—"}°C · RH {stageMeta.start_readings.relative_humidity_pct ?? "—"}% ·
+                    Dew {stageMeta.start_readings.dew_point_c ?? "—"}°C · Surface {stageMeta.start_readings.surface_temp_c ?? "—"}°C
+                  </Text>
+                ) : null}
                 {Object.keys(stageMeta.start_fields ?? {}).length > 0 ? (
                   <Text style={[type.bodySm, { marginTop: 6 }]}>
                     {startDefs
@@ -450,6 +505,11 @@ export default function StageFormScreen() {
               </Card>
             ) : null}
 
+            {/* Environmental + surface-temp capture only on stages that take
+                coat readings — Curing + QA (requires_coat_readings=false)
+                shows neither the weather fetch nor the surface-temp gate */}
+            {needsReadings ? (
+            <>
             {/* Weather block (auto) */}
             <Card>
               <View style={styles.rowBetween}>
@@ -505,6 +565,8 @@ export default function StageFormScreen() {
                 <StatusPill status={gate.ok ? "pass" : "fail"} testID={`gate-pill-${phase}`} />
               </View>
             </Card>
+            </>
+            ) : null}
 
             {/* Stage fields for the current capture phase */}
             {activeDefs.length > 0 ? (
@@ -566,7 +628,7 @@ export default function StageFormScreen() {
               <Text style={type.caption}>
                 {phase === "start" ? "Record conditions to begin this stage" : "Ready to submit end-of-stage inspection"}
               </Text>
-              <StatusPill status={anyHardBlock ? "fail" : gate.ok ? "pass" : "in_progress"} />
+              <StatusPill status={anyHardBlock ? "fail" : !needsReadings || gate.ok ? "pass" : "in_progress"} />
             </View>
             {phase === "start" ? (
               <TouchableOpacity
