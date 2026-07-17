@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import re
 import smtplib
 import tempfile
 import time
@@ -66,7 +67,8 @@ pool: Optional[asyncpg.Pool] = None
 # Stage sequences and per-stage field sets live in case_type_stage_templates;
 # each work order snapshots its case's template rows into work_order_stages at
 # creation. This Literal mirrors the DB CHECK constraint on work_orders.case_type.
-CaseType = Literal["only_primer", "primer_intermediate", "primer_intermediate_top", "top_coat_only"]
+CaseType = Literal["only_primer", "primer_intermediate", "primer_intermediate_top", "top_coat_only",
+                   "primer_top_coat"]
 
 MILS_TO_UM = 25.4
 
@@ -340,10 +342,15 @@ def _coat_limits_from_paint_system_row(row: dict) -> dict:
             round(primer[0] + (intermediate[0] if intermediate else 0), 1),
             round(primer[1] + (intermediate[1] if intermediate else 0), 1),
         ]
+    # primer_top_coat skips the intermediate, so its cumulative top-coat window
+    # is primer+top summed — same convention as mid_cumulative above.
+    primer_top = None
+    if primer and top:
+        primer_top = [round(primer[0] + top[0], 1), round(primer[1] + top[1], 1)]
     # "top" is the standalone top-coat window (used by top_coat_only, where
     # there is no primer underneath); "total" is the full-system cumulative.
     return {"primer": primer, "intermediate": intermediate, "top": top,
-            "mid_cumulative": mid, "total": total}
+            "mid_cumulative": mid, "primer_top_cumulative": primer_top, "total": total}
 
 
 def _dft_limits_for_stage(wo: dict, stage: dict):
@@ -466,6 +473,16 @@ def _validate_stage_fields(wo: dict, stage: dict, values: dict, phase: str = "en
                 date.fromisoformat(str(val))
             except ValueError:
                 errors.append(f"{label}: invalid date, expected YYYY-MM-DD")
+        elif ftype == "date_dmy":
+            # strict DD/MM/YYYY: zero-padded, "/" separators, real calendar date
+            sval = str(val)
+            if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", sval):
+                errors.append(f"{label}: invalid date, expected DD/MM/YYYY")
+            else:
+                try:
+                    datetime.strptime(sval, "%d/%m/%Y")
+                except ValueError:
+                    errors.append(f"{label}: '{sval}' is not a valid calendar date (DD/MM/YYYY)")
         elif ftype == "time":
             try:
                 dt_time.fromisoformat(str(val))

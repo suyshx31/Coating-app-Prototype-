@@ -12,6 +12,19 @@ from typing import Optional
 
 COAT_KEYS = ["primer", "second", "third", "fourth"]
 STAGE_TO_COAT = {"primer_coat": "primer", "intermediate_coat": "second", "top_coat": "third"}
+# Template column per coat stage, by case type. Columns follow application
+# sequence, so primer_top_coat's top coat lands in "2nd" (intermediate is
+# skipped). top_coat_only keeps its established "3rd" placement.
+CASE_COAT_COLUMNS = {
+    "only_primer": {"primer_coat": "primer"},
+    "primer_intermediate": {"primer_coat": "primer", "intermediate_coat": "second"},
+    "primer_intermediate_top": {"primer_coat": "primer", "intermediate_coat": "second", "top_coat": "third"},
+    "primer_top_coat": {"primer_coat": "primer", "top_coat": "second"},
+    "top_coat_only": {"top_coat": "third"},
+}
+# per-coat spec window key in coat_limits, and legacy curing_qa batch suffix
+STAGE_ROLE = {"primer_coat": "primer", "intermediate_coat": "intermediate", "top_coat": "top"}
+CUMULATIVE_WINDOWS = ("mid_cumulative", "primer_top_cumulative", "total")
 
 NA = "NA"
 
@@ -111,10 +124,7 @@ def build_nov_payload(wo: dict, ps: Optional[dict], inspector_names: dict,
     # ---- coats: applications, conditions, batches, DFT ----
     qa = _stage(wo, "curing_qa")
     qa_f = _merged_fields(qa)
-    batch_by_coat = {"primer": qa_f.get("batch_number_primer"),
-                     "second": qa_f.get("batch_number_intermediate"),
-                     "third": qa_f.get("batch_number_top"), "fourth": None}
-    limits_by_coat = {"primer": "primer", "second": "intermediate", "third": "top", "fourth": None}
+    batch_by_coat = {k: None for k in COAT_KEYS}
 
     na_app = {"product": NA, "color": NA, "date": NA, "time": NA, "operator": NA}
     na_cond = {"booth_temp": NA, "surface_temp": NA, "dew_point": NA, "relative_humidity": NA}
@@ -124,14 +134,19 @@ def build_nov_payload(wo: dict, ps: Optional[dict], inspector_names: dict,
     dft_measured = {k: [NA, NA] for k in COAT_KEYS}
 
     coat_limits = wo.get("coat_limits") or {}
+    columns = CASE_COAT_COLUMNS.get(wo.get("case_type"), STAGE_TO_COAT)
     last_coat_stage = None
     prev_cumulative = None
-    for stage_key, coat in STAGE_TO_COAT.items():
+    for stage_key, coat in columns.items():
         s = _stage(wo, stage_key)
         if not s:
             continue
         last_coat_stage = s
         f = _merged_fields(s)
+        role = STAGE_ROLE[stage_key]
+        # batch number now captured at the coat stage itself; legacy WOs
+        # (submitted before the move) still carry it on curing_qa
+        batch_by_coat[coat] = f.get("batch_number") or qa_f.get(f"batch_number_{role}")
         # "RAL 3001 · Signal red" overflows the template's COLOR column — keep the code
         color = str(f.get("color") or f.get("paint_shade") or f.get("ral_shade") or NA)
         color = color.split("·")[0].strip()
@@ -149,16 +164,16 @@ def build_nov_payload(wo: dict, ps: Optional[dict], inspector_names: dict,
             "dew_point": _rng(_c_to_f(start.get("dew_point_c")), None, " °F"),
             "relative_humidity": _rng(start.get("relative_humidity_pct"), None, "%"),
         }
-        window = coat_limits.get(limits_by_coat[coat])
+        window = coat_limits.get(role)
         if window:
             dft_spec[coat] = [_um_to_mils(window[0]), _um_to_mils(window[1])]
         measured = f.get("dft_um")
         if measured is not None:
-            # intermediate/top stages capture CUMULATIVE DFT (their dft_window is
-            # mid_cumulative/total); the template wants per-coat, so subtract the
-            # previous coat's cumulative reading before converting
+            # later coat stages capture CUMULATIVE DFT (their dft_window is
+            # mid_cumulative/primer_top_cumulative/total); the template wants
+            # per-coat, so subtract the previous coat's cumulative reading
             per_coat = float(measured)
-            if s.get("dft_window") in ("mid_cumulative", "total") and prev_cumulative is not None:
+            if s.get("dft_window") in CUMULATIVE_WINDOWS and prev_cumulative is not None:
                 per_coat = float(measured) - prev_cumulative
             prev_cumulative = float(measured)
             # single captured value: reported in both min/max measured columns

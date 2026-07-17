@@ -86,10 +86,12 @@ def collect_report_data(wo: dict, company: Optional[dict]) -> dict:
         })
         conditions.append({"coat": label, "readings": _readings_str(s.get("start_readings"))})
         suffix = COAT_SUFFIX[s["key"]]
+        # batch/expiry are captured at the coat stage since migration 0010;
+        # older WOs carry them on curing_qa (legacy per-coat keys)
         batches.append({
             "coat": label,
-            "batch": qa_fields.get(f"batch_number_{suffix}", "—"),
-            "expiry": qa_fields.get(f"expiry_date_{suffix}", "—"),
+            "batch": f.get("batch_number") or qa_fields.get(f"batch_number_{suffix}", "—"),
+            "expiry": f.get("expiry_date") or qa_fields.get(f"expiry_date_{suffix}", "—"),
         })
         window = None
         if s.get("dft_window") and (wo.get("coat_limits") or {}).get(s["dft_window"]):
