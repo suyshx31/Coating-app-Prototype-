@@ -419,7 +419,10 @@ export default function NewWorkOrderScreen() {
                 </View>
                 <View style={styles.dupRow}>
                   <Text style={type.caption}>CREATED AT</Text>
-                  <Text style={type.mono}>{new Date(duplicateWo.created_at).toLocaleString()}</Text>
+                  <Text style={type.mono}>{new Date(duplicateWo.created_at).toLocaleString(undefined, {
+                    year: "numeric", month: "short", day: "2-digit",
+                    hour: "2-digit", minute: "2-digit", hour12: false,
+                  })}</Text>
                 </View>
                 <View style={styles.dupRow}>
                   <Text style={type.caption}>QTY</Text>

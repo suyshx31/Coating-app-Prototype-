@@ -11,7 +11,7 @@ import { Card, DataId, Label, StatusPill } from "@/src/components/UI";
 function fmtTs(iso: string) {
   try {
     const d = new Date(iso);
-    return d.toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
   } catch {
     return iso;
   }
