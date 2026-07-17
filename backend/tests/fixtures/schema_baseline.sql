@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict dD35Z7YjS4RFNB6ONhoNME9maFXKhyaIiv1dalo7Px2XzZbfri28URRIe0jf1f2
+\restrict cCpfCCRACmY0Xqag1o1lQeBqRJMILcoMxLK2EAVqzP8xy31R1yIU2hq1Xq9UaIz
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.10 (Debian 17.10-1.pgdg13+1)
@@ -23,7 +23,6 @@ SET row_security = off;
 -- Name: public; Type: SCHEMA; Schema: -; Owner: -
 --
 
--- CREATE SCHEMA public; (exists on vanilla postgres)
 
 
 --
@@ -141,7 +140,9 @@ CREATE TABLE public.paint_products (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     brand text NOT NULL,
     product_name text NOT NULL,
-    coat_roles text[] DEFAULT '{}'::text[] NOT NULL
+    coat_roles text[] DEFAULT '{}'::text[] NOT NULL,
+    mixing_ratio text,
+    wft_to_dft_ratio numeric
 );
 
 
@@ -315,7 +316,7 @@ CREATE TABLE public.work_orders (
     paint_system_id uuid,
     coat_limits jsonb,
     case_type text NOT NULL,
-    CONSTRAINT work_orders_case_type_check CHECK ((case_type = ANY (ARRAY['only_primer'::text, 'primer_intermediate'::text, 'primer_intermediate_top'::text, 'top_coat_only'::text])))
+    CONSTRAINT work_orders_case_type_check CHECK ((case_type = ANY (ARRAY['only_primer'::text, 'primer_intermediate'::text, 'primer_intermediate_top'::text, 'top_coat_only'::text, 'primer_top_coat'::text])))
 );
 
 
@@ -647,5 +648,5 @@ ALTER TABLE ONLY public.work_orders
 -- PostgreSQL database dump complete
 --
 
-\unrestrict dD35Z7YjS4RFNB6ONhoNME9maFXKhyaIiv1dalo7Px2XzZbfri28URRIe0jf1f2
+\unrestrict cCpfCCRACmY0Xqag1o1lQeBqRJMILcoMxLK2EAVqzP8xy31R1yIU2hq1Xq9UaIz
 
