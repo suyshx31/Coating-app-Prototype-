@@ -585,6 +585,9 @@ async def seed_data():
                 ("QC-7841", "Reyes, M.", "m.reyes@aerospace-precision.com", "Inspector",
                  "Bravo - Section 2", "Surface Coating & Prep",
                  "https://images.pexels.com/photos/29852895/pexels-photo-29852895.jpeg"),
+                # matches the login form's pre-filled default credentials
+                ("QC-1001", "Inspector One", "login1@inspector.com", "Inspector",
+                 "Alpha - Section 1", "Surface Coating & Prep", None),
             ]
             for emp, name, email, role, shift, dept, avatar in inspectors:
                 await conn.execute(
