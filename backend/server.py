@@ -24,10 +24,9 @@ import logging
 import os
 import random
 import re
-import smtplib
+import resend
 import tempfile
 import time
-from email.message import EmailMessage
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
@@ -1180,39 +1179,49 @@ class GenerateReportRequest(BaseModel):
     message: Optional[str] = ""
 
 
-def _attachment_media(filename: str) -> tuple[str, str]:
-    return ("application", "pdf") if filename.endswith(".pdf") else \
-        ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+def _attachment_media(filename: str) -> str:
+    return "application/pdf" if filename.endswith(".pdf") else \
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+# Resend sandbox sender — replace with a verified-domain address once one exists
+RESEND_FROM = "onboarding@resend.dev"
 
 
 async def _send_email_with_attachments(subject: str, body_text: str,
                                        recipients: List[str],
                                        attachments: List[tuple[str, bytes]]):
-    """Send via the configured Gmail SMTP account; raises HTTPException on failure."""
-    gmail_user = os.environ.get("GMAIL_USER", "")
-    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
-    if not gmail_user or not gmail_pass:
-        raise HTTPException(503, "Email not configured: set GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env")
+    """Send via the Resend HTTPS API; raises HTTPException on failure.
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = gmail_user
-    msg["To"] = ", ".join(recipients)
-    msg.set_content(body_text)
-    for filename, content in attachments:
-        maintype, subtype = _attachment_media(filename)
-        msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
+    Railway blocks outbound SMTP on the current plan ([Errno 101] on 465/587),
+    so Gmail/smtplib is not usable in production."""
+    api_key = os.environ.get("RESEND_API_KEY", "")
+    if not api_key:
+        raise HTTPException(503, "Email not configured: set RESEND_API_KEY in backend/.env")
+
+    params: resend.Emails.SendParams = {
+        "from": RESEND_FROM,
+        "to": recipients,
+        "subject": subject,
+        "text": body_text,
+        "attachments": [
+            {"filename": filename, "content": list(content),
+             "content_type": _attachment_media(filename)}
+            for filename, content in attachments
+        ],
+    }
 
     def _send():
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
-            smtp.login(gmail_user, gmail_pass)
-            smtp.send_message(msg)
+        resend.api_key = api_key
+        resend.Emails.send(params)
 
     try:
         await asyncio.get_running_loop().run_in_executor(None, _send)
-    except smtplib.SMTPAuthenticationError:
-        raise HTTPException(502, "Gmail rejected the credentials (use an App Password, not the account password)")
-    except (smtplib.SMTPException, OSError) as e:
+    except resend.exceptions.InvalidApiKeyError:
+        raise HTTPException(502, "Resend rejected the API key (check RESEND_API_KEY)")
+    except resend.exceptions.ResendError as e:
+        raise HTTPException(502, f"Email send failed: {e}")
+    except (requests.RequestException, OSError) as e:
         raise HTTPException(502, f"Email send failed: {e}")
 
 
@@ -1227,6 +1236,9 @@ def _convert_xlsx_to_pdf(xlsx_path: str) -> bytes:
     install LibreOffice). The rendered layout is CloudConvert's LibreOffice
     engine, matching the previous local-soffice output."""
     api_key = os.environ.get("CLOUDCONVERT_API_KEY", "")
+    print(f"[CLOUDCONVERT DEBUG] key present: {bool(api_key)}, length: {len(api_key)}, "
+          f"preview: {api_key[:4]}...{api_key[-4:] if len(api_key) > 8 else 'TOO_SHORT'}",
+          flush=True)
     if not api_key:
         raise RuntimeError("CLOUDCONVERT_API_KEY not set — required for xlsx→pdf conversion")
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -1243,7 +1255,9 @@ def _convert_xlsx_to_pdf(xlsx_path: str) -> bytes:
                 "export": {"operation": "export/url", "input": "convert"},
             },
         })
+        print(f"[CLOUDCONVERT DEBUG] job create: HTTP {resp.status_code}", flush=True)
         if resp.status_code not in (200, 201):
+            print(f"[CLOUDCONVERT DEBUG] job create error body: {resp.text}", flush=True)
             raise _fail("job create", resp)
         job = resp.json()["data"]
 
@@ -1252,18 +1266,25 @@ def _convert_xlsx_to_pdf(xlsx_path: str) -> bytes:
         with open(xlsx_path, "rb") as fh:
             up = requests.post(form["url"], data=form["parameters"],
                                files={"file": (os.path.basename(xlsx_path), fh)}, timeout=120)
+        print(f"[CLOUDCONVERT DEBUG] file upload: HTTP {up.status_code}", flush=True)
         if up.status_code not in (200, 201):
+            print(f"[CLOUDCONVERT DEBUG] file upload error body: {up.text}", flush=True)
             raise _fail("file upload", up)
 
         deadline = time.monotonic() + 180
         while True:
             resp = requests.get(f"{CLOUDCONVERT_API}/jobs/{job['id']}", headers=headers, timeout=30)
             if resp.status_code != 200:
+                print(f"[CLOUDCONVERT DEBUG] status poll: HTTP {resp.status_code} body: {resp.text}",
+                      flush=True)
                 raise _fail("status poll", resp)
             job = resp.json()["data"]
+            print(f"[CLOUDCONVERT DEBUG] poll: job {job['id']} status={job['status']} "
+                  f"tasks={[(t['name'], t['status']) for t in job['tasks']]}", flush=True)
             if job["status"] == "finished":
                 break
             if job["status"] == "error":
+                print(f"[CLOUDCONVERT DEBUG] job error body: {resp.text}", flush=True)
                 errs = "; ".join(f"{t['name']}: {t.get('message') or 'error'}"
                                  for t in job["tasks"] if t["status"] == "error")
                 raise RuntimeError(f"CloudConvert conversion failed: {errs or 'unknown error'}")
@@ -1336,8 +1357,8 @@ async def download_report(work_order_id: str, format: Literal["pdf", "xlsx"] = "
 @api.post("/work-orders/{work_order_id}/report/send")
 async def send_report(work_order_id: str, body: SendReportRequest, current=Depends(get_current_user)):
     # config guard up front — don't build reports that can't be sent
-    if not os.environ.get("GMAIL_USER") or not os.environ.get("GMAIL_APP_PASSWORD"):
-        raise HTTPException(503, "Email not configured: set GMAIL_USER and GMAIL_APP_PASSWORD in backend/.env")
+    if not os.environ.get("RESEND_API_KEY"):
+        raise HTTPException(503, "Email not configured: set RESEND_API_KEY in backend/.env")
     assert pool is not None
     async with pool.acquire() as conn:
         attachments = [await _build_report(conn, work_order_id, fmt, current) for fmt in body.formats]

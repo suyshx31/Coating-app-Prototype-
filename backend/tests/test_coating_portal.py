@@ -594,7 +594,7 @@ class TestReports:
         assert r.status_code == 201
         listed = requests.get(f"{API}/report-recipients", headers=auth, timeout=15).json()
         assert any(x["email"] == "qa.lead@example.com" for x in listed)
-        # sending without GMAIL_* env must 503, not crash (test stack has none)
+        # sending without RESEND_API_KEY must 503, not crash (test stack has none)
         r2 = requests.post(f"{API}/work-orders/WO-0000-0000/report/send",
                            json={"recipients": ["qa.lead@example.com"], "formats": ["pdf"]},
                            headers=auth, timeout=15)
@@ -613,7 +613,7 @@ class TestReports:
         body = r.json()
         assert body["ok"] is True
         assert body["filename"].endswith(".pdf")
-        # no GMAIL_* env on the test stack: generation still succeeds,
+        # no RESEND_API_KEY on the test stack: generation still succeeds,
         # the email failure is reported instead of aborting
         assert body["email_sent"] is False
         assert "Email not configured" in (body["email_error"] or "")

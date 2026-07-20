@@ -20,7 +20,7 @@ import { colors, radius, spacing, type } from "@/src/theme";
 
 export default function LoginScreen() {
   const router = useRouter();
-  const [email, setEmail] = useState("j.thompson@aerospace-precision.com");
+  const [email, setEmail] = useState("login1@inspector.com");
   const [password, setPassword] = useState("Inspector@123");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +58,7 @@ export default function LoginScreen() {
               <Ionicons name="shield-checkmark" size={28} color={colors.accent} />
             </View>
             <Text style={styles.brandLabel}>ISO 9001 · SECURE</Text>
-            <Text style={styles.brandTitle}>TechniSure S</Text>
+            <Text style={styles.brandTitle}>Coating Process Portal App</Text>
             <Text style={styles.brandSub}>QC Inspection · Traceability</Text>
           </View>
 
